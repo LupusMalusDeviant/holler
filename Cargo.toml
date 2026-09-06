@@ -1,6 +1,6 @@
 [package]
 name = "holler"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2021"
 authors = ["Lupus Malus Deviant"]
 description = "Holler: LAN-Funk ohne Umwege. Rohes PCM per UDP, ein Fenster, eine Exe."

@@ -65,7 +65,7 @@ impl Default for Config {
             update_check: true,
             room: String::new(),
             room_password: String::new(),
-            hub: "168.119.111.164:4712".into(),
+            hub: DEFAULT_HUB.into(),
             codec: "opus32".into(),
             input: None,
             output: None,
@@ -75,6 +75,10 @@ impl Default for Config {
         }
     }
 }
+
+/// Vermittler-Vorgabe. Die IP-Vorgabe aus 0.4 bis 1.1 wird beim Laden auf den Namen umgestellt.
+pub const DEFAULT_HUB: &str = "holler.app.lupusmalus.dev:4712";
+const OLD_HUB_IP: &str = "168.119.111.164:4712";
 
 pub fn default_path() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("holler").join("config.toml"))
@@ -94,6 +98,9 @@ impl Config {
             None => Config::default(),
         };
         cfg.path = path;
+        if cfg.hub.trim() == OLD_HUB_IP {
+            cfg.hub = DEFAULT_HUB.into();
+        }
         if cfg.peer_id == 0 {
             cfg.peer_id = rand::random::<u64>().max(1);
             cfg.save();

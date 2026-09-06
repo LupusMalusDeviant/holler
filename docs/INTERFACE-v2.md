@@ -241,8 +241,9 @@ protokollinkompatibel zu 0.2, also beide Rechner gleichzeitig aktualisieren
    JOIN/MEMBERS, Hole-Punching mit PROBE/PROBE-ACK und Vorrang LAN › IPv6 › IPv4,
    nach 2 s ohne Direktweg Relay über den Hub, Rückfall bei totem Weg, eigene
    öffentliche Adresse im Fenster. Gemessen von hier: Hub 23 ms Laufzeit, Relay
-   mit 6 ms Jitter und 3–4 Rahmen Puffer. Hub-Domain (z. B.
-   `holler.app.lupusmalus.dev`) noch nicht angelegt, Vorgabe ist die IP.
+   mit 6 ms Jitter und 3–4 Rahmen Puffer. Hub-Domain `holler.app.lupusmalus.dev` seit 1.1.1 öffentlich bei Infomaniak
+   gesetzt und Vorgabe im Client; alte Konfigurationen mit der IP werden beim
+   Laden umgestellt.
 7. **Phase 3 umgesetzt als Version 1.0.0** (6. September 2026): Opus über
    `opus-pure` (reines Rust, bitgenau zu libopus), 10-ms-Rahmen, VoIP-Profil,
    Qualität wählbar im Fenster mit Erklärzeile (PCM / 64 / 32 / 16 kbit/s),

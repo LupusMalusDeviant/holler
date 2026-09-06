@@ -84,7 +84,7 @@ und einen Schalter „Ton aus“, der nur bei dir wirkt. „Mein Name“ ist fre
 wählbar. Der Mixer summiert alle Stimmen mit weichem Begrenzer.
 
 **Über das Internet** braucht es einen Vermittler (Hub). Holler ist auf den Hub
-`168.119.111.164:4712` voreingestellt; im Fenster unter „Vermittler“ änderbar,
+`holler.app.lupusmalus.dev:4712` voreingestellt; im Fenster unter „Vermittler“ änderbar,
 leer = nur LAN. Sobald ein Raum betreten ist, meldet sich Holler beim Hub, der
 allen im Raum die Adressen der anderen mitteilt. Dann versuchen beide Seiten
 gleichzeitig eine Direktverbindung (Hole-Punching durch den Heimrouter), mit
