@@ -10,6 +10,18 @@ trotzdem hören wollen.
 Der Entwurf mit Latenzbudget, Fensterbeschreibung und Protokoll steht in
 [docs/INTERFACE.md](docs/INTERFACE.md).
 
+## Download
+
+Fertige Version unter **[Releases](https://github.com/LupusMalusDeviant/holler/releases/latest)**:
+`holler.exe` (signiert), `LupusMalusDeviant.cer` und `vertrauen.cmd`. Die Exe auf
+beide Rechner, fertig. Wer den Hinweis „Unbekannter Herausgeber“ loswerden will,
+legt `.cer` und `vertrauen.cmd` nebeneinander und startet das `.cmd` als
+Administrator. SmartScreen meldet sich bei Downloads einmal: „Weitere
+Informationen“, „Trotzdem ausführen“.
+
+Neue Versionen entstehen automatisch: ein Tag `v0.2.0` auf GitHub baut, signiert
+und veröffentlicht (siehe `.github/workflows/release.yml`).
+
 ## Bauen
 
 ```
