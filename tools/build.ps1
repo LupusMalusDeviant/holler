@@ -52,7 +52,7 @@ if (Test-Path $iscc) {
         $wrapper = Join-Path $env:TEMP "holler-sign-one.cmd"
         "@echo off`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$root\tools\sign.ps1`" -Exe %1" | Out-File -Encoding ascii $wrapper
         $isArgs += "/DSignSetup"
-        $isArgs += "/Sholler=`"$wrapper`" `$f"
+        $isArgs += "/Sholler=cmd /c $wrapper `$f"
     }
     $isArgs += "installer\holler.iss"
     Write-Host "== Installer bauen (Inno Setup)"

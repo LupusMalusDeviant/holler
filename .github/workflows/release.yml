@@ -90,7 +90,8 @@ jobs:
           $args = @("/DAppVersion=$ver", "/DExeDir=target\release")
           if ("${{ steps.sign.outputs.enabled }}" -eq "true") {
             $args += "/DSignSetup"
-            $args += "/Sholler=`"${{ steps.sign.outputs.wrapper }}`" `$f"
+            # Keine Anfuehrungszeichen: PowerShell wuerde sie als \" weiterreichen und Inno faende die Datei nicht.
+            $args += "/Sholler=cmd /c ${{ steps.sign.outputs.wrapper }} `$f"
           }
           $args += "installer\holler.iss"
           & $iscc @args
