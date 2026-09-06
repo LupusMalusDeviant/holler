@@ -176,9 +176,10 @@ pub fn quit() {
 pub fn refresh() {
     let Some(c) = CTL.get() else { return };
     let muted = c.shared.muted.load(Relaxed);
+    let count = c.shared.peer_count();
     let conn: u8 = if c.shared.connected() {
         2
-    } else if c.shared.peer_addr().is_some() {
+    } else if count > 0 {
         1
     } else {
         0
@@ -200,9 +201,9 @@ pub fn refresh() {
             }
         };
         let state = match conn {
-            2 => "verbunden",
-            1 => "warte auf Antwort",
-            _ => "suche",
+            2 => format!("verbunden · {count}"),
+            1 => "warte auf Audio".to_string(),
+            _ => "suche".to_string(),
         };
         let tip = format!("Holler · {state}{}", if muted { " · stumm" } else { "" });
         if let Some(i) = &t.icon {

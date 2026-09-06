@@ -7,10 +7,14 @@ use std::path::PathBuf;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Config {
+    /// Zufällige Kennung dieser Installation, wird beim ersten Start erzeugt
+    pub peer_id: u64,
     pub port: u16,
     pub frame_ms: u8,
     pub jitter: String,
+    /// Lautstärke für neue Teilnehmer in Prozent
     pub volume: u32,
+    /// Anzeigename bei den anderen
     pub name: String,
     pub hotkey: String,
     pub headset_ms: u32,
@@ -23,16 +27,23 @@ pub struct Config {
     pub denoise: bool,
     /// Beim Start auf neue Releases prüfen
     pub update_check: bool,
+    /// Raum und Passwort, vorausgefüllt für den nächsten Klick auf „Beitreten“
+    pub room: String,
+    pub room_password: String,
     #[serde(rename = "in")]
     pub input: Option<String>,
     #[serde(rename = "out")]
     pub output: Option<String>,
-    pub peer: Option<String>,
+    /// Feste Gegenstellen „ip“ oder „ip:port“, zusätzlich zur Suche
+    pub peers: Vec<String>,
+    #[serde(skip)]
+    pub path: Option<PathBuf>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
+            peer_id: 0,
             port: 4711,
             frame_ms: 5,
             jitter: "auto".into(),
@@ -45,37 +56,49 @@ impl Default for Config {
             gate_vad: 0.5,
             denoise: true,
             update_check: true,
+            room: String::new(),
+            room_password: String::new(),
             input: None,
             output: None,
-            peer: None,
+            peers: Vec::new(),
+            path: None,
         }
     }
 }
 
-pub fn path() -> Option<PathBuf> {
+pub fn default_path() -> Option<PathBuf> {
     std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("holler").join("config.toml"))
 }
 
 impl Config {
-    pub fn load() -> Config {
-        let Some(p) = path() else { return Config::default() };
-        match std::fs::read_to_string(&p) {
-            Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
-                eprintln!("Konfiguration {} unlesbar ({e}), nehme Vorgaben.", p.display());
-                Config::default()
-            }),
-            Err(_) => Config::default(),
+    pub fn load(path: Option<PathBuf>) -> Config {
+        let path = path.or_else(default_path);
+        let mut cfg = match &path {
+            Some(p) => match std::fs::read_to_string(p) {
+                Ok(s) => toml::from_str(&s).unwrap_or_else(|e| {
+                    eprintln!("Konfiguration {} unlesbar ({e}), nehme Vorgaben.", p.display());
+                    Config::default()
+                }),
+                Err(_) => Config::default(),
+            },
+            None => Config::default(),
+        };
+        cfg.path = path;
+        if cfg.peer_id == 0 {
+            cfg.peer_id = rand::random::<u64>().max(1);
+            cfg.save();
         }
+        cfg
     }
 
     pub fn save(&self) {
-        let Some(p) = path() else { return };
+        let Some(p) = &self.path else { return };
         if let Some(dir) = p.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         match toml::to_string_pretty(self) {
             Ok(s) => {
-                if let Err(e) = std::fs::write(&p, s) {
+                if let Err(e) = std::fs::write(p, s) {
                     eprintln!("Konfiguration konnte nicht geschrieben werden: {e}");
                 }
             }

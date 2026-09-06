@@ -1,11 +1,10 @@
-//! Verdrahtung: Socket, Netz-Thread, Geräte, Aufnahme- und Wiedergabestrom.
+//! Verdrahtung: Sockets, Netz-Threads, Geräte, Aufnahme- und Wiedergabestrom.
 //! Lebt auf dem Hauptthread; Streams werden bei Gerätewechsel neu geöffnet.
 
-use crate::audio::{self, Capture, Devices, Playback, SharedConsumer};
+use crate::audio::{self, Capture, Consumers, Devices, Playback};
 use crate::config::Config;
-use crate::net::{self, NetCfg, Wire};
-use crate::state::Shared;
-use std::net::{Ipv4Addr, UdpSocket};
+use crate::net::{self, NetCfg, Sockets, Wire};
+use crate::state::{Shared, MAX_PEERS};
 use std::sync::{Arc, Mutex};
 
 pub struct Engine {
@@ -16,8 +15,8 @@ pub struct Engine {
     pub out_error: Option<String>,
     capture: Option<Capture>,
     playback: Option<Playback>,
-    consumer: SharedConsumer,
-    socket: Arc<UdpSocket>,
+    consumers: Consumers,
+    pub sockets: Arc<Sockets>,
     shared: Arc<Shared>,
 }
 
@@ -28,13 +27,20 @@ pub enum EngineError {
 
 impl Engine {
     pub fn new(cfg: &Config, shared: Arc<Shared>) -> Result<Engine, EngineError> {
-        let socket = net::bind(cfg.port).map_err(EngineError::Port)?;
-        let (producer, consumer) = rtrb::RingBuffer::<i16>::new(48_000);
-        let peer = match &cfg.peer {
-            Some(p) => Some(p.trim().parse::<Ipv4Addr>().map_err(|_| EngineError::Device(format!("Peer-Adresse unlesbar: {p}")))?),
-            None => None,
-        };
-        net::spawn(socket.clone(), shared.clone(), producer, NetCfg { port: cfg.port, peer, name: cfg.name.clone() });
+        let sockets = Sockets::bind(cfg.port).map_err(EngineError::Port)?;
+        let mut producers = Vec::with_capacity(MAX_PEERS);
+        let mut consumers = Vec::with_capacity(MAX_PEERS);
+        for _ in 0..MAX_PEERS {
+            let (p, c) = rtrb::RingBuffer::<i16>::new(48_000);
+            producers.push(p);
+            consumers.push(c);
+        }
+        let mut peers = Vec::new();
+        for p in &cfg.peers {
+            peers.push(net::parse_peer(p, cfg.port).map_err(EngineError::Device)?);
+        }
+        let table = net::Table::new(producers, cfg.frame_samples() as usize);
+        net::spawn(sockets.clone(), shared.clone(), table, NetCfg { peers });
 
         let host = cpal::default_host();
         let devices = audio::enumerate(&host);
@@ -55,8 +61,8 @@ impl Engine {
             out_error: None,
             capture: None,
             playback: None,
-            consumer: Arc::new(Mutex::new(consumer)),
-            socket,
+            consumers: Arc::new(Mutex::new(consumers)),
+            sockets,
             shared,
         };
         e.select_input(in_idx);
@@ -70,7 +76,7 @@ impl Engine {
         self.in_idx = idx;
         if let Some(i) = idx {
             if let Some((name, dev)) = self.devices.inputs.get(i) {
-                match audio::open_capture(dev, self.shared.clone(), Wire::new(self.socket.clone(), self.shared.clone())) {
+                match audio::open_capture(dev, self.shared.clone(), Wire::new(self.sockets.clone(), self.shared.clone())) {
                     Ok(c) => {
                         eprintln!("Mikrofon: {name} ({} Hz, {} Kanäle)", c.rate, c.channels);
                         self.capture = Some(c);
@@ -87,7 +93,7 @@ impl Engine {
         self.out_idx = idx;
         if let Some(i) = idx {
             if let Some((name, dev)) = self.devices.outputs.get(i) {
-                match audio::open_playback(dev, self.shared.clone(), self.consumer.clone()) {
+                match audio::open_playback(dev, self.shared.clone(), self.consumers.clone()) {
                     Ok(p) => {
                         eprintln!("Ausgabe: {name} ({} Hz, {} Kanäle)", p.rate, p.channels);
                         self.playback = Some(p);
@@ -104,5 +110,10 @@ impl Engine {
 
     pub fn output_name(&self) -> Option<&str> {
         self.out_idx.and_then(|i| self.devices.outputs.get(i)).map(|(n, _)| n.as_str())
+    }
+
+    /// Den anderen Bescheid sagen, bevor wir gehen.
+    pub fn leave(&self) {
+        net::send_leave(&self.sockets, &self.shared);
     }
 }

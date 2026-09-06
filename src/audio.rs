@@ -3,7 +3,7 @@
 //! linear umgerechnet, damit auch 16-kHz-Funkmikros und 44,1-kHz-Ausgaben gehen.
 
 use crate::net::Wire;
-use crate::state::{Shared, RATE};
+use crate::state::{Shared, MAX_PEERS, RATE};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 use std::sync::atomic::Ordering::Relaxed;
@@ -240,31 +240,44 @@ pub struct Playback {
     pub channels: u16,
 }
 
-pub type SharedConsumer = Arc<Mutex<rtrb::Consumer<i16>>>;
+/// Ein Ring pro Teilnehmerplatz; der Mixer sperrt einmal pro Callback.
+pub type Consumers = Arc<Mutex<Vec<rtrb::Consumer<i16>>>>;
 
-pub fn open_playback(dev: &cpal::Device, shared: Arc<Shared>, consumer: SharedConsumer) -> Result<Playback, String> {
+pub fn open_playback(dev: &cpal::Device, shared: Arc<Shared>, consumers: Consumers) -> Result<Playback, String> {
     let sup = dev.default_output_config().map_err(|e| format!("Wiedergabeformat: {e}"))?;
     let rate = sup.sample_rate().0;
     let channels = sup.channels();
     let config: cpal::StreamConfig = sup.clone().into();
     let stream = match sup.sample_format() {
-        cpal::SampleFormat::F32 => build_out::<f32>(dev, &config, rate, channels, shared, consumer),
-        cpal::SampleFormat::I16 => build_out::<i16>(dev, &config, rate, channels, shared, consumer),
-        cpal::SampleFormat::U16 => build_out::<u16>(dev, &config, rate, channels, shared, consumer),
-        cpal::SampleFormat::I32 => build_out::<i32>(dev, &config, rate, channels, shared, consumer),
+        cpal::SampleFormat::F32 => build_out::<f32>(dev, &config, rate, channels, shared, consumers),
+        cpal::SampleFormat::I16 => build_out::<i16>(dev, &config, rate, channels, shared, consumers),
+        cpal::SampleFormat::U16 => build_out::<u16>(dev, &config, rate, channels, shared, consumers),
+        cpal::SampleFormat::I32 => build_out::<i32>(dev, &config, rate, channels, shared, consumers),
         other => return Err(format!("Wiedergabeformat {other:?} nicht unterstützt")),
     }?;
     stream.play().map_err(|e| format!("Wiedergabe starten: {e}"))?;
     Ok(Playback { _stream: stream, rate, channels })
 }
 
+/// Weicher Begrenzer: bis 0,8 linear, darüber gestaucht, nie über 1.
+fn limit(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= 0.8 {
+        x
+    } else {
+        let y = 0.8 + (a - 0.8) / (1.0 + (a - 0.8) * 3.0);
+        y.min(1.0) * x.signum()
+    }
+}
+
+/// Mixer: summiert alle aktiven Teilnehmer bei 48 kHz, dann Umrechnung auf die Geräterate.
 fn build_out<T>(
     dev: &cpal::Device,
     config: &cpal::StreamConfig,
     rate: u32,
     channels: u16,
     shared: Arc<Shared>,
-    consumer: SharedConsumer,
+    consumers: Consumers,
 ) -> Result<cpal::Stream, String>
 where
     T: SizedSample + FromSample<f32>,
@@ -274,42 +287,61 @@ where
     dev.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            let mut cons = match consumer.lock() {
+            let mut cons = match consumers.lock() {
                 Ok(c) => c,
                 Err(p) => p.into_inner(),
             };
-            let skip = shared.skip_samples.swap(0, Relaxed);
-            for _ in 0..skip {
-                if cons.pop().is_err() {
-                    break;
+            for (i, p) in shared.peers.iter().enumerate() {
+                let skip = p.skip_samples.swap(0, Relaxed);
+                for _ in 0..skip {
+                    if cons[i].pop().is_err() {
+                        break;
+                    }
                 }
             }
-            let vol = shared.volume_f();
-            let mut priming = shared.priming.load(Relaxed);
-            let mut sum_sq = 0.0f32;
+            let mut sums = [0.0f32; MAX_PEERS];
+            let mut pulled: u32 = 0;
+            let mut mix_sq = 0.0f32;
             let frames = (data.len() / ch).max(1);
             for fr in data.chunks_mut(ch) {
-                let s = if priming {
-                    0.0
-                } else {
-                    match rs.next(|| cons.pop().ok().map(|v| v as f32 / 32768.0)) {
-                        Some(v) => v * vol,
-                        None => {
-                            priming = true;
-                            shared.priming.store(true, Relaxed);
-                            shared.underruns.fetch_add(1, Relaxed);
-                            0.0
+                let s = rs
+                    .next(|| {
+                        pulled += 1;
+                        let mut sum = 0.0f32;
+                        for (i, p) in shared.peers.iter().enumerate() {
+                            if !p.active.load(Relaxed) || p.priming.load(Relaxed) {
+                                continue;
+                            }
+                            match cons[i].pop() {
+                                Ok(v) => {
+                                    let f = v as f32 / 32768.0;
+                                    sums[i] += f * f;
+                                    if !p.local_mute.load(Relaxed) {
+                                        sum += f * p.volume_f();
+                                    }
+                                }
+                                Err(_) => {
+                                    p.priming.store(true, Relaxed);
+                                    p.underruns.fetch_add(1, Relaxed);
+                                }
+                            }
                         }
-                    }
-                };
-                sum_sq += s * s;
-                let s = s.clamp(-1.0, 1.0);
+                        Some(limit(sum))
+                    })
+                    .unwrap_or(0.0);
+                mix_sq += s * s;
                 for x in fr.iter_mut() {
                     *x = T::from_sample(s);
                 }
             }
-            shared.spk_level.store((sum_sq / frames as f32).sqrt().to_bits(), Relaxed);
-            shared.buffered_samples.store(cons.slots() as u32, Relaxed);
+            let n48 = pulled.max(1) as f32;
+            for (i, p) in shared.peers.iter().enumerate() {
+                if p.active.load(Relaxed) {
+                    p.level.store((sums[i] / n48).sqrt().to_bits(), Relaxed);
+                    p.buffered_samples.store(cons[i].slots() as u32, Relaxed);
+                }
+            }
+            shared.spk_level.store((mix_sq / frames as f32).sqrt().to_bits(), Relaxed);
         },
         |e| eprintln!("Wiedergabefehler: {e}"),
         None,

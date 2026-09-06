@@ -61,10 +61,11 @@ in der Liste auf (Lautstärke pro Person).
 
 | Element | Verhalten |
 |---|---|
-| **Raum / Passwort** | Freier Name, beliebiges Passwort. Beide zusammen ergeben Raum-ID und Schlüssel (Abschnitt 4.3). Wer beides kennt, ist drin. „Beitreten“ merkt sich beides; beim nächsten Start wird automatisch wieder beigetreten. Leer = LAN-Modus wie bisher, ohne Server. |
-| **Vermittler** | Vorbelegt mit deinem Server, änderbar in der Konfiguration. Zeigt Zustand und Laufzeit zum Server. Fällt der Server aus, bleiben bestehende Direktverbindungen offen; Relay-Verbindungen brechen ab, das Fenster sagt es. |
+| **Raum / Passwort** | Freier Name, beliebiges Passwort. Beide zusammen ergeben Raum-ID und Schlüssel (Abschnitt 4.3). Wer beides kennt, ist drin. „Beitreten“ merkt sich beides für den nächsten Klick, tritt aber nicht automatisch bei (Entscheidung des Nutzers). Leer = LAN-Modus wie bisher, ohne Server. |
+| **Vermittler** | Vorbelegt mit deinem Hub (eigener Server, „Apps-Server“, Phase 2), änderbar in der Konfiguration. Zeigt Zustand und Laufzeit zum Server. Fällt der Server aus, bleiben bestehende Direktverbindungen offen; Relay-Verbindungen brechen ab, das Fenster sagt es. |
 | **Qualität für Ferne** | Auswahl mit einer Erklärzeile darunter, siehe Abschnitt 5. Gilt nur für das eigene Senden an Nicht-LAN-Peers. LAN-Peers bekommen immer PCM, automatisch. |
 | **Teilnehmerzeile** | Punkt (grün = Audio kommt, gelb = verbindet, rot = weg), Name, Weg (LAN direkt / direkt IPv6 / direkt IPv4 / Relay), Laufzeit, Codec, Pegel, Lautstärkeregler 0–300 %, lokaler Stumm-Schalter (nur ich höre die Person nicht). Reihenfolge: LAN zuerst, dann nach Beitritt. |
+| **Mein Name** | Frei wählbar, Vorgabe Rechnername. Steht bei den anderen in der Liste. |
 | **Kopfzeile** | Pille zeigt „im Raum · n“ oder „LAN · verbunden“ oder „suche“. |
 | **Stumm (F9)** | Unverändert, gilt für alle Empfänger. |
 
@@ -219,17 +220,18 @@ Version 0.2 bleibt als „LAN-only“ voll funktionsfähig; Phase 1 ist
 protokollinkompatibel zu 0.2, also beide Rechner gleichzeitig aktualisieren
 (der Updater macht das ohnehin).
 
-## 9. Offene Fragen an dich
+## 9. Entscheidungen (6. September 2026)
 
-1. **Welcher Server** für den Hub: BurgCloud, Rabenhof oder Zirkuswagen? Und
-   gibt es eine Domain, die darauf zeigen soll (z. B. `holler.<deine-domain>`)?
-   Sonst nimmt der Client die IP.
-2. **Raumpasswort-Weitergabe**: per Hand (Discord, WhatsApp) reicht? Der
-   Einladungslink aus Phase 4 wäre bequemer, kostet aber einen URL-Handler in
-   der Installation.
-3. **Namen** der Teilnehmer: Rechnername wie heute, oder frei wählbar im Fenster?
-   (Empfehlung: frei wählbar, Vorgabe Rechnername.)
-4. **Beim Start automatisch dem letzten Raum beitreten** — ja? (Empfehlung: ja,
-   mit sichtbarem „Verlassen“.)
-
-Nach deinem Okay zu Entwurf und Antworten beginne ich mit Phase 1.
+1. **Hub-Server**: ein eigener Server, voraussichtlich der „Apps-Server“. Adresse
+   und Domain werden in Phase 2 festgelegt.
+2. **Namen**: frei wählbar im Fenster, Vorgabe Rechnername.
+3. **Beitreten**: jedes Mal per Klick, kein automatisches Beitreten. Raum und
+   Passwort bleiben vorausgefüllt.
+4. **Raumpasswort-Weitergabe**: per Hand; Einladungslink bleibt Phase 4.
+5. Entwurf freigegeben. **Phase 1 umgesetzt als Version 0.3.0** (6. September
+   2026): Protokoll v2, Räume mit Verschlüsselung, IPv4+IPv6, bis 8 Teilnehmer,
+   Mixer mit Begrenzer, Teilnehmerliste. Nebenbei behoben: Taktdrift zwischen
+   Aufnahme- und Wiedergabegerät liess den Jitter-Puffer in 0.2 auf 30–40 ms
+   kriechen; jetzt regelt eine Füllstandsregelung pro Teilnehmer (Rahmen
+   vorab doppelt einsetzen bzw. verwerfen), Zielpuffer bleibt bei 2–3 Rahmen.
+   IPv6-Suche im LAN läuft noch nicht per Multicast, nur über feste Adressen.

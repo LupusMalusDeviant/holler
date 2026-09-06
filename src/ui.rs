@@ -1,15 +1,15 @@
 //! Das eine Fenster. Liest nur Atomics, zeichnet mit 30 Hz.
-//! Kopfzeile mit Status, drei Karten (Verbindung, Mikrofon, Partner),
-//! darunter der grosse Live/Stumm-Knopf.
+//! Kopfzeile mit Status, Karten Raum, Teilnehmer, Mikrofon, Ausgabe, darunter der Live/Stumm-Knopf.
 
 use crate::config::Config;
+use crate::crypto;
 use crate::engine::Engine;
-use crate::state::{lin_to_db, Shared, MAX_TARGET};
+use crate::net;
+use crate::state::{lin_to_db, path_name, Shared, MAX_PEERS, MAX_TARGET};
 use crate::tray;
 use crate::update::{self, State as UpState, Updater};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -35,14 +35,16 @@ pub struct App {
     tray_error: Option<String>,
     last_muted: bool,
     theme_set: bool,
-    volume: f32,
     mic_gain_db: f32,
     gate_on: bool,
     denoise: bool,
     jitter_choice: u32,
+    name_edit: String,
+    room_edit: String,
+    pw_edit: String,
     peer_edit: String,
     peer_error: Option<String>,
-    meters: [Meter; 2],
+    meters: Vec<Meter>,
     updater: Arc<Updater>,
 }
 
@@ -69,6 +71,9 @@ impl Meter {
     }
 }
 
+const METER_MIC: usize = MAX_PEERS;
+const METER_MIX: usize = MAX_PEERS + 1;
+
 impl App {
     pub fn new(shared: Arc<Shared>, engine: Engine, cfg: Config, cc: &eframe::CreationContext<'_>, start_hidden: bool, updater: Arc<Updater>) -> Self {
         let hwnd = match cc.window_handle() {
@@ -79,21 +84,22 @@ impl App {
             Err(_) => 0,
         };
         let report = tray::init(shared.clone(), cc.egui_ctx.clone(), hwnd, &cfg.hotkey, start_hidden);
-        let volume = shared.volume_f() * 100.0;
-        let jitter_choice = if shared.jitter_auto.load(Relaxed) { 0 } else { shared.target_frames.load(Relaxed) };
+        let jitter_choice = if shared.jitter_auto.load(Relaxed) { 0 } else { shared.jitter_fixed.load(Relaxed) };
         App {
             hotkey_error: report.hotkey_error,
             tray_error: report.tray_error,
             last_muted: false,
             theme_set: false,
-            volume,
             mic_gain_db: cfg.mic_gain_db,
             gate_on: cfg.gate_on,
             denoise: cfg.denoise,
             jitter_choice,
-            peer_edit: cfg.peer.clone().unwrap_or_default(),
+            name_edit: cfg.name.clone(),
+            room_edit: cfg.room.clone(),
+            pw_edit: cfg.room_password.clone(),
+            peer_edit: String::new(),
             peer_error: None,
-            meters: [Meter::new(), Meter::new()],
+            meters: (0..MAX_PEERS + 2).map(|_| Meter::new()).collect(),
             updater,
             shared,
             engine,
@@ -155,20 +161,26 @@ impl App {
         for e in [&self.hotkey_error, &self.tray_error, &self.peer_error].into_iter().flatten() {
             v.push((AMBER, e.clone()));
         }
-        if let Ok(sp) = s.second_peer.lock() {
-            if let Some(n) = sp.as_ref() {
-                v.push((AMBER, format!("Zweiter Rechner gesehen und ignoriert: {n}")));
+        if s.room_full.load(Relaxed) {
+            v.push((AMBER, "Raum voll: mehr als 8 Teilnehmer, jemand wurde abgewiesen.".into()));
+        }
+        if s.bad_auth.load(Relaxed) > 0 {
+            v.push((AMBER, "Jemand sendet mit anderem Passwort oder ohne Raum. Diese Pakete werden verworfen.".into()));
+        }
+        if s.foreign_room.load(Relaxed) > 0 && s.peer_count() == 0 {
+            v.push((AMBER, "Im Netz ist jemand in einem anderen Raum. Gleicher Raumname und gleiches Passwort nötig.".into()));
+        }
+        let now = s.now_ms();
+        for p in s.peers.iter().filter(|p| p.active.load(Relaxed)) {
+            if p.streaming(now) && p.jitter_us.load(Relaxed) > 20_000 {
+                v.push((AMBER, format!("{}: Jitter über 20 ms. WLAN auf 5 GHz, Headset-Dongle weg vom Gehäuse.", p.name())));
+            }
+            if p.streaming(now) && p.loss_permille.load(Relaxed) > 20 {
+                v.push((AMBER, format!("{}: über 2 % Paketverlust, Funknetz überlastet oder gestört.", p.name())));
             }
         }
-        if s.connected() {
-            if s.jitter_us.load(Relaxed) > 20_000 {
-                v.push((AMBER, "Jitter über 20 ms. WLAN-Rechner auf 5 GHz, Headset-Dongle weg vom Gehäuse.".into()));
-            }
-            if s.loss_permille.load(Relaxed) > 20 {
-                v.push((AMBER, "Über 2 % Paketverlust. Das Funknetz ist überlastet oder gestört.".into()));
-            }
-        } else if s.peer_addr().is_none() {
-            v.push((AMBER, "Kein Gegenüber gefunden. Läuft Holler drüben? Firewall für private Netze erlauben, sonst IP eintragen.".into()));
+        if s.peer_count() == 0 && !s.room_busy.load(Relaxed) {
+            v.push((AMBER, "Noch niemand da. Läuft Holler drüben? Firewall für private Netze erlauben, sonst IP eintragen.".into()));
         }
         v
     }
@@ -190,13 +202,13 @@ impl App {
     }
 
     /// Segmentierte Pegelanzeige mit Spitzenwert. `level` ist RMS 0..1.
-    fn meter(ui: &mut egui::Ui, meter: &mut Meter, level: f32, clip: bool, dim: bool) {
+    fn meter(ui: &mut egui::Ui, meter: &mut Meter, level: f32, clip: bool, dim: bool, width: f32) {
         let v = (level * 3.0).clamp(0.0, 1.0);
         let peak = meter.feed(v);
         let h = 12.0;
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, h), egui::Sense::hover());
         let p = ui.painter();
-        let n = 36usize;
+        let n = (width / 9.0).clamp(12.0, 40.0) as usize;
         let gap = 2.0;
         let w = (rect.width() - gap * (n as f32 - 1.0)) / n as f32;
         let lit = (v * n as f32).round() as usize;
@@ -205,9 +217,7 @@ impl App {
             let x = rect.left() + i as f32 * (w + gap);
             let seg = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, h));
             let frac = (i + 1) as f32 / n as f32;
-            let on_color = if clip {
-                RED
-            } else if frac > 0.9 {
+            let on_color = if clip || frac > 0.9 {
                 RED
             } else if frac > 0.72 {
                 AMBER
@@ -227,13 +237,10 @@ impl App {
         }
     }
 
-    fn device_combo(ui: &mut egui::Ui, id: &str, list: &[(String, cpal::Device)], current: Option<usize>, none_label: Option<&str>) -> Option<usize> {
+    fn device_combo(ui: &mut egui::Ui, id: &str, list: &[(String, cpal::Device)], current: Option<usize>) -> Option<usize> {
         let mut sel = current;
-        let text = current.and_then(|i| list.get(i)).map(|(n, _)| n.as_str()).unwrap_or(none_label.unwrap_or("— kein Gerät —"));
+        let text = current.and_then(|i| list.get(i)).map(|(n, _)| n.as_str()).unwrap_or("— kein Gerät —");
         egui::ComboBox::from_id_salt(id).width(ui.available_width()).selected_text(text).show_ui(ui, |ui| {
-            if let Some(l) = none_label {
-                ui.selectable_value(&mut sel, None, l);
-            }
             for (i, (n, _)) in list.iter().enumerate() {
                 ui.selectable_value(&mut sel, Some(i), n);
             }
@@ -256,6 +263,44 @@ impl App {
             });
     }
 
+    fn dot(ui: &mut egui::Ui, color: Color32, filled: bool) {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+        if filled {
+            ui.painter().circle_filled(rect.center(), 5.0, color);
+        } else {
+            ui.painter().circle_stroke(rect.center(), 5.0, Stroke::new(1.5, color));
+        }
+    }
+
+    fn join_room(&mut self) {
+        let name = self.room_edit.trim().to_string();
+        let pw = self.pw_edit.clone();
+        self.cfg.room = name.clone();
+        self.cfg.room_password = pw.clone();
+        self.cfg.save();
+        self.engine.leave();
+        if name.is_empty() {
+            self.shared.set_room(None);
+            return;
+        }
+        self.shared.room_busy.store(true, Relaxed);
+        self.shared.clear_peers();
+        let sh = self.shared.clone();
+        std::thread::Builder::new()
+            .name("holler-room".into())
+            .spawn(move || {
+                let room = crypto::derive(&name, &pw);
+                eprintln!("Raum „{}“ beigetreten, Pakete verschlüsselt.", room.name);
+                sh.set_room(Some(room));
+                sh.room_busy.store(false, Relaxed);
+            })
+            .ok();
+    }
+
+    fn leave_room(&mut self) {
+        self.engine.leave();
+        self.shared.set_room(None);
+    }
 }
 
 impl eframe::App for App {
@@ -273,6 +318,7 @@ impl eframe::App for App {
         }
 
         let s = self.shared.clone();
+        let now = s.now_ms();
         let muted = s.muted.load(Relaxed);
         if muted != self.last_muted {
             self.last_muted = muted;
@@ -280,17 +326,17 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.to_string()));
         }
 
-        // Verbindungszustand für Kopfzeile und Karte.
-        let (conn_color, conn_short, conn_long) = match (s.peer_addr(), s.connected()) {
-            (Some(a), true) => {
-                let name = s.peer_name.lock().map(|n| n.clone()).unwrap_or_default();
-                let name = if name.is_empty() { "Peer".to_string() } else { name };
-                let m = if s.peer_muted.load(Relaxed) { "  ·  stumm" } else { "" };
-                (GREEN, format!("verbunden · {name}"), format!("{name}  ({}){m}", a.ip()))
-            }
-            (Some(a), false) if s.ever_connected() => (RED, "keine Pakete".to_string(), format!("Verbindung zu {} abgerissen", a.ip())),
-            (Some(a), false) => (AMBER, "warte".to_string(), format!("warte auf Antwort von {}", a.ip())),
-            (None, _) => (MUTED_TEXT, "suche".to_string(), "suche im Netz…".to_string()),
+        let room = s.room();
+        let busy = s.room_busy.load(Relaxed);
+        let count = s.peer_count();
+        let (conn_color, conn_short) = if busy {
+            (AMBER, "Schlüssel …".to_string())
+        } else if s.connected() {
+            (GREEN, if room.is_some() { format!("im Raum · {count}") } else { format!("LAN · {count}") })
+        } else if count > 0 {
+            (AMBER, format!("{count} da, kein Audio"))
+        } else {
+            (MUTED_TEXT, "suche".to_string())
         };
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin::symmetric(18, 14))).show(ctx, |ui| {
@@ -307,6 +353,7 @@ impl eframe::App for App {
                     });
                 });
                 ui.add_space(6.0);
+
                 // Update-Hinweis
                 let up = self.updater.state();
                 match &up {
@@ -361,87 +408,176 @@ impl eframe::App for App {
                 }
                 ui.add_space(4.0);
 
-                // ---------------- Verbindung ----------------
-                Self::card(ui, "Verbindung", |ui| {
-                    ui.label(RichText::new(&conn_long).size(15.0));
-                    let sw = s.software_latency_ms();
+                // ---------------- Raum ----------------
+                let mut do_join = false;
+                let mut do_leave = false;
+                Self::card(ui, "Raum", |ui| {
                     ui.horizontal(|ui| {
-                        let stat = |ui: &mut egui::Ui, label: &str, value: String| {
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new(label).color(MUTED_TEXT).size(11.0));
-                                ui.label(RichText::new(value).size(14.0).strong());
-                            });
-                            ui.add_space(14.0);
-                        };
-                        if s.connected() {
-                            stat(ui, "Laufzeit", format!("{:.1} ms", s.rtt_us.load(Relaxed) as f32 / 2000.0));
-                            stat(ui, "Jitter", format!("{:.0} ms", s.jitter_us.load(Relaxed) as f32 / 1000.0));
-                            stat(ui, "Verlust", format!("{:.1} %", s.loss_permille.load(Relaxed) as f32 / 10.0));
-                        }
-                        stat(ui, "Software", format!("{sw:.0} ms"));
-                        stat(ui, "Gesamt ≈", format!("{:.0} ms", sw + self.cfg.headset_ms as f32));
-                    });
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("IP manuell").color(MUTED_TEXT));
-                        let r = ui.add(egui::TextEdit::singleline(&mut self.peer_edit).desired_width(140.0).hint_text("192.168.178.42"));
-                        let go = ui.button("Verbinden").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                        if go {
-                            match self.peer_edit.trim().parse::<Ipv4Addr>() {
-                                Ok(ip) => {
-                                    self.peer_error = None;
-                                    self.cfg.peer = Some(ip.to_string());
-                                    s.clear_peer();
-                                    s.set_peer(std::net::SocketAddr::V4(std::net::SocketAddrV4::new(ip, self.cfg.port)));
+                        ui.label(RichText::new("Mein Name").color(MUTED_TEXT));
+                        if ui.add(egui::TextEdit::singleline(&mut self.name_edit).desired_width(180.0)).changed() {
+                            let n = self.name_edit.trim().to_string();
+                            if !n.is_empty() {
+                                if let Ok(mut g) = s.name.lock() {
+                                    *g = n.clone();
                                 }
-                                Err(_) => self.peer_error = Some(format!("Keine gültige IPv4-Adresse: {}", self.peer_edit.trim())),
+                                self.cfg.name = n;
                             }
                         }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Raum").color(MUTED_TEXT));
+                        let r1 = ui.add_enabled(room.is_none() && !busy, egui::TextEdit::singleline(&mut self.room_edit).desired_width(150.0).hint_text("z. B. hunt-abend"));
+                        ui.label(RichText::new("Passwort").color(MUTED_TEXT));
+                        let r2 = ui.add_enabled(room.is_none() && !busy, egui::TextEdit::singleline(&mut self.pw_edit).desired_width(130.0).password(true));
+                        let enter = (r1.lost_focus() || r2.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if room.is_some() {
+                            if ui.button("Verlassen").clicked() {
+                                do_leave = true;
+                            }
+                        } else if busy {
+                            ui.add_enabled(false, egui::Button::new("Schlüssel …"));
+                        } else if ui.button("Beitreten").clicked() || enter {
+                            do_join = true;
+                        }
+                    });
+                    let sw = s.software_latency_ms();
+                    let status = if busy {
+                        "Raumschlüssel wird berechnet, dauert einen Moment …".to_string()
+                    } else if let Some(r) = &room {
+                        format!("Im Raum „{}“: alle Pakete verschlüsselt, nur wer Raum und Passwort kennt, hört mit.", r.name)
+                    } else {
+                        "Ohne Raum: offenes LAN wie bisher, unverschlüsselt. Für Verschlüsselung Raum und Passwort setzen.".to_string()
+                    };
+                    ui.label(RichText::new(status).color(MUTED_TEXT).size(12.0));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("IP manuell").color(MUTED_TEXT));
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.peer_edit).desired_width(170.0).hint_text("192.168.1.5 oder [fe80::1]:4711"));
+                        let go = ui.button("Hinzufügen").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                        if go && !self.peer_edit.trim().is_empty() {
+                            match net::parse_peer(&self.peer_edit, self.cfg.port) {
+                                Ok(a) => {
+                                    self.peer_error = None;
+                                    if let Ok(mut m) = s.manual_peers.lock() {
+                                        if !m.contains(&a) {
+                                            m.push(a);
+                                        }
+                                    }
+                                    if !self.cfg.peers.iter().any(|p| p == self.peer_edit.trim()) {
+                                        self.cfg.peers.push(self.peer_edit.trim().to_string());
+                                        self.cfg.save();
+                                    }
+                                    self.peer_edit.clear();
+                                }
+                                Err(e) => self.peer_error = Some(e),
+                            }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(RichText::new(format!("Software ≈ {sw:.0} ms + Funk {} ms", self.cfg.headset_ms)).color(MUTED_TEXT).size(12.0));
+                        });
                     });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Puffer").color(MUTED_TEXT));
-                        {
-                            let target = s.target_frames.load(Relaxed);
-                            let frame_ms = s.frame_ms();
-                            let buffered_ms = s.buffered_samples.load(Relaxed) as f32 / 48.0;
-                            let fill = buffered_ms / (MAX_TARGET as f32 * frame_ms);
-                            let before = self.jitter_choice;
-                            egui::ComboBox::from_id_salt("jitter")
-                                .width(96.0)
-                                .selected_text(if self.jitter_choice == 0 { "Auto".to_string() } else { format!("{} Rahmen", self.jitter_choice) })
-                                .show_ui(ui, |ui| {
-                                    ui.selectable_value(&mut self.jitter_choice, 0, "Auto");
-                                    for n in 1..=MAX_TARGET {
-                                        ui.selectable_value(&mut self.jitter_choice, n, format!("{n} Rahmen"));
-                                    }
-                                });
-                            if before != self.jitter_choice {
-                                if self.jitter_choice == 0 {
-                                    s.jitter_auto.store(true, Relaxed);
-                                    self.cfg.jitter = "auto".into();
-                                } else {
-                                    s.jitter_auto.store(false, Relaxed);
-                                    s.target_frames.store(self.jitter_choice, Relaxed);
-                                    self.cfg.jitter = self.jitter_choice.to_string();
+                        let before = self.jitter_choice;
+                        egui::ComboBox::from_id_salt("jitter")
+                            .width(110.0)
+                            .selected_text(if self.jitter_choice == 0 { "Auto".to_string() } else { format!("{} Rahmen", self.jitter_choice) })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.jitter_choice, 0, "Auto");
+                                for n in 1..=MAX_TARGET {
+                                    ui.selectable_value(&mut self.jitter_choice, n, format!("{n} Rahmen"));
                                 }
+                            });
+                        if before != self.jitter_choice {
+                            if self.jitter_choice == 0 {
+                                s.jitter_auto.store(true, Relaxed);
+                                self.cfg.jitter = "auto".into();
+                            } else {
+                                s.jitter_auto.store(false, Relaxed);
+                                s.jitter_fixed.store(self.jitter_choice, Relaxed);
+                                self.cfg.jitter = self.jitter_choice.to_string();
                             }
-                            ui.add(egui::ProgressBar::new(fill.clamp(0.0, 1.0)).desired_width(120.0).desired_height(8.0).fill(BLUE));
-                            ui.label(RichText::new(format!("{buffered_ms:.0} ms gefüllt · Ziel {target} Rahmen ({:.0} ms)", target as f32 * frame_ms)).color(MUTED_TEXT).size(12.0));
+                        }
+                        let manual: Vec<String> = s.manual_peers.lock().map(|m| m.iter().map(|a| a.to_string()).collect()).unwrap_or_default();
+                        if !manual.is_empty() {
+                            ui.label(RichText::new(format!("feste Adressen: {}", manual.join(", "))).color(MUTED_TEXT).size(12.0));
                         }
                     });
                 });
+                if do_join {
+                    self.join_room();
+                }
+                if do_leave {
+                    self.leave_room();
+                }
+
+                // ---------------- Teilnehmer ----------------
+                let mut meters = std::mem::take(&mut self.meters);
+                Self::card(ui, &format!("Teilnehmer · {count}"), |ui| {
+                    let mut any = false;
+                    let mut order: Vec<usize> = (0..MAX_PEERS).filter(|&i| s.peers[i].active.load(Relaxed)).collect();
+                    order.sort_by_key(|&i| (s.peers[i].path.load(Relaxed), s.peers[i].joined_ms.load(Relaxed)));
+                    for i in order {
+                        let p = &s.peers[i];
+                        any = true;
+                        let streaming = p.streaming(now);
+                        let ever = p.last_rx_ms.load(Relaxed) != u64::MAX;
+                        let (color, filled) = if streaming { (GREEN, true) } else if ever { (RED, true) } else { (AMBER, false) };
+                        ui.horizontal(|ui| {
+                            Self::dot(ui, color, filled);
+                            let name = p.name();
+                            ui.label(RichText::new(if name.is_empty() { "…".to_string() } else { name }).size(14.0).strong());
+                            let m = if p.remote_muted.load(Relaxed) { " · stumm" } else { "" };
+                            let info = format!(
+                                "{} · {:.1} ms · Jitter {:.0} · Puffer {}/{:.0} ms · PCM{m}",
+                                path_name(p.path.load(Relaxed)),
+                                p.rtt_us.load(Relaxed) as f32 / 2000.0,
+                                p.jitter_us.load(Relaxed) as f32 / 1000.0,
+                                p.target_frames.load(Relaxed),
+                                p.buffered_samples.load(Relaxed) as f32 / 48.0,
+                            );
+                            ui.label(RichText::new(info).color(MUTED_TEXT).size(11.5));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.add_space(22.0);
+                            let lm = p.local_mute.load(Relaxed);
+                            Self::meter(ui, &mut meters[i], p.level_f(), false, lm || !streaming, 150.0);
+                            let mut vol = p.volume_f() * 100.0;
+                            ui.spacing_mut().slider_width = 150.0;
+                            if ui.add(egui::Slider::new(&mut vol, 0.0..=300.0).suffix(" %").fixed_decimals(0)).changed() {
+                                p.volume.store((vol / 100.0).to_bits(), Relaxed);
+                            }
+                            let label = if lm { "Ton an" } else { "Ton aus" };
+                            let btn = egui::Button::new(RichText::new(label).size(12.0));
+                            let btn = if lm { btn.fill(RED.linear_multiply(0.3)) } else { btn };
+                            if ui.add(btn).on_hover_text("Nur bei mir stumm, die anderen hören die Person weiter").clicked() {
+                                p.local_mute.store(!lm, Relaxed);
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
+                    if !any {
+                        let text = if busy {
+                            "Schlüssel wird berechnet …"
+                        } else if room.is_some() {
+                            "Noch niemand im Raum. Im selben Netz findet Holler die anderen von selbst, sonst IP oben eintragen."
+                        } else {
+                            "Noch niemand da. Im selben Netz findet Holler die anderen von selbst, sonst IP oben eintragen."
+                        };
+                        ui.label(RichText::new(text).color(MUTED_TEXT).size(12.0));
+                    }
+                });
 
                 // ---------------- Mikrofon ----------------
-                let mut meters = std::mem::replace(&mut self.meters, [Meter::new(), Meter::new()]);
                 Self::card(ui, "Mikrofon", |ui| {
-                    let sel = Self::device_combo(ui, "in", &self.engine.devices.inputs, self.engine.in_idx, None);
+                    let sel = Self::device_combo(ui, "in", &self.engine.devices.inputs, self.engine.in_idx);
                     if sel != self.engine.in_idx {
                         self.engine.select_input(sel);
                         self.cfg.input = self.engine.input_name().map(|n| n.to_string());
                     }
                     let level = s.mic_level_f();
                     let gate_closed = self.gate_on && !s.gate_open.load(Relaxed);
-                    Self::meter(ui, &mut meters[0], level, s.mic_clip.load(Relaxed), gate_closed || muted);
+                    let w = ui.available_width();
+                    Self::meter(ui, &mut meters[METER_MIC], level, s.mic_clip.load(Relaxed), gate_closed || muted, w);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(format!("{:>4.0} dB", lin_to_db(level))).color(MUTED_TEXT).size(12.0).monospace());
                         let (c, state) = if muted {
@@ -476,23 +612,17 @@ impl eframe::App for App {
                     ui.label(RichText::new("Rauschunterdrückung nimmt Grundrauschen, Lüfter und Tastatur aus der Stimme. Die Sprechsperre sendet nur, wenn gesprochen wird.").color(MUTED_TEXT).size(11.0));
                 });
 
-                // ---------------- Partner ----------------
-                Self::card(ui, "Partner hören", |ui| {
-                    let sel = Self::device_combo(ui, "out", &self.engine.devices.outputs, self.engine.out_idx, None);
+                // ---------------- Ausgabe ----------------
+                Self::card(ui, "Ausgabe", |ui| {
+                    let sel = Self::device_combo(ui, "out", &self.engine.devices.outputs, self.engine.out_idx);
                     if sel != self.engine.out_idx {
                         self.engine.select_output(sel);
                         self.cfg.output = self.engine.output_name().map(|n| n.to_string());
                     }
-                    Self::meter(ui, &mut meters[1], s.spk_level_f(), false, false);
-                    ui.horizontal(|ui| {
-                        ui.label(RichText::new("Lautstärke").color(MUTED_TEXT));
-                        if ui.add(egui::Slider::new(&mut self.volume, 0.0..=300.0).suffix(" %").fixed_decimals(0)).changed() {
-                            s.set_volume_f(self.volume / 100.0);
-                            self.cfg.volume = self.volume.round() as u32;
-                        }
-                    });
+                    let w = ui.available_width();
+                    Self::meter(ui, &mut meters[METER_MIX], s.spk_level_f(), false, false, w);
+                    ui.label(RichText::new("Summe aller Teilnehmer. Lautstärke pro Person in der Liste oben.").color(MUTED_TEXT).size(11.0));
                 });
-
                 self.meters = meters;
 
                 // ---------------- Stumm ----------------
@@ -521,7 +651,17 @@ impl eframe::App for App {
                     UpState::ReadyToQuit => "Installer läuft, Holler startet neu".to_string(),
                     UpState::Failed(e) => format!("Update-Prüfung: {e}"),
                 };
-                ui.label(RichText::new(format!("Holler {} · Lupus Malus Deviant · {}{}", update::VERSION, up_text, if update::is_installed() { "" } else { " · portabel" })).color(MUTED_TEXT).size(11.0));
+                ui.label(
+                    RichText::new(format!(
+                        "Holler {} · Lupus Malus Deviant · {}{}{}",
+                        update::VERSION,
+                        up_text,
+                        if update::is_installed() { "" } else { " · portabel" },
+                        if s.ipv6.load(Relaxed) { " · IPv4+IPv6" } else { " · nur IPv4" }
+                    ))
+                    .color(MUTED_TEXT)
+                    .size(11.0),
+                );
                 ui.add_space(6.0);
             });
         });
@@ -540,6 +680,7 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.engine.leave();
         self.cfg.save();
     }
 }

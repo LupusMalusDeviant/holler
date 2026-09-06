@@ -2,8 +2,8 @@
 
 # Holler
 
-LAN-Funk ohne Umwege: Sprachverbindung zwischen zwei Rechnern im selben Netz,
-ohne Server, ohne Codec, ohne Browser. Rohes PCM per UDP, ein kleines Fenster, eine Exe.
+LAN-Funk ohne Umwege: Sprachverbindung für bis zu acht Leute im selben Netz,
+ohne Server, ohne Codec, ohne Browser. Auf Wunsch verschlüsselt in einem Raum. Rohes PCM per UDP, ein kleines Fenster, eine Exe.
 Gedacht für zwei Leute, die nebeneinander mit Headsets spielen und sich
 trotzdem hören wollen.
 
@@ -68,6 +68,24 @@ Broadcast von selbst. Findet sich nichts nach ein paar Sekunden:
    Windows Broadcasts. Unter Einstellungen → Netzwerk → das WLAN → auf
    „Privat“ stellen.
 
+## Räume: verschlüsselt und bis zu acht Leute
+
+Ohne Raum verhält sich Holler wie ein offenes LAN: jeder im Netz, der Holler
+startet, ist dabei, unverschlüsselt. Für Verschlüsselung tragen alle denselben
+**Raum** und dasselbe **Passwort** ein und klicken „Beitreten“. Aus beidem
+entsteht ein Schlüssel; jedes Audio-Paket ist damit verschlüsselt und
+authentifiziert (ChaCha20-Poly1305, Schlüssel per Argon2id). Wer ein anderes
+Passwort hat, wird gesehen, aber nicht gehört, das Fenster sagt es. Rechner in
+einem anderen Raum ignorieren sich. Raum und Passwort bleiben für den nächsten
+Klick vorausgefüllt, beigetreten wird bewusst per Hand.
+
+In der Teilnehmerliste hat jede Person eigenen Pegel, Lautstärke 0 bis 300 %
+und einen Schalter „Ton aus“, der nur bei dir wirkt. „Mein Name“ ist frei
+wählbar. Der Mixer summiert alle Stimmen mit weichem Begrenzer.
+
+IPv4 und IPv6 laufen gleichzeitig; die Suche per Broadcast ist IPv4, eine
+IPv6-Adresse kann unter „IP manuell“ eingetragen werden (`[fe80::1]:4711`).
+
 Stumm schalten: Taste **F9** (auch wenn das Spiel im Vordergrund ist), der
 Knopf im Fenster oder das Tray-Menü. Solange stumm, hat das Fenster einen
 roten Rahmen und das Tray-Symbol ist rot.
@@ -85,20 +103,27 @@ startet das Programm direkt im Tray.
 ## Optionen
 
 ```
-holler [--peer <ip>] [--port 4711] [--in <name|index>] [--out <name|index>]
-         [--frame 5|10] [--jitter auto|1..8] [--volume 0..300] [--name <text>]
-         [--mic-gain 0..30] [--gate 0.05..0.95|off] [--denoise on|off] [--hotkey F9] [--headset-ms 40]
-         [--hidden] [--headless] [--list-devices]
+holler [--room <name> --room-password <text>] [--name <text>]
+       [--peer <ip[:port]>]... [--port 4711] [--in <name|index>] [--out <name|index>]
+       [--frame 5|10] [--jitter auto|1..8] [--volume 0..300]
+       [--mic-gain 0..30] [--gate 0.05..0.95|off] [--denoise on|off]
+       [--hotkey F9] [--headset-ms 40] [--config <datei>]
+       [--hidden] [--no-update-check] [--headless] [--list-devices]
 ```
 
 Alles, was im Fenster verändert wird (Geräte, Lautstärke, Puffer, Peer-IP),
 landet beim Beenden in `%APPDATA%\holler\config.toml` und gilt beim
 nächsten Start wieder.
 
-`--list-devices` zeigt die Geräte mit Index. `--headless` läuft ohne Fenster
-mit einer Statuszeile in der Konsole. `--peer 127.0.0.1` ist ein
-Schleifentest auf dem eigenen Rechner: man hört sich selbst mit der
-Software-Verzögerung.
+`--room` auf der Kommandozeile tritt sofort beim Start bei. `--list-devices`
+zeigt die Geräte mit Index. `--headless` läuft ohne Fenster mit einer
+Statuszeile in der Konsole. `--config` nimmt eine andere Konfigurationsdatei,
+damit zwei Instanzen auf einem Rechner laufen können, z. B. zum Testen:
+
+```
+holler --headless --config a.toml --port 4799 --name A --room t --room-password x --peer 127.0.0.1:4798
+holler --headless --config b.toml --port 4798 --name B --room t --room-password x --peer 127.0.0.1:4799
+```
 
 ## Lautstärke, Rauschunterdrückung, Sprechsperre
 
@@ -160,7 +185,8 @@ Leute die Exe herunterladen sollen.
 
 ## Grenzen
 
-- Nur IPv4, nur zwei Teilnehmer, keine Verschlüsselung. Es ist ein Heimnetz.
+- Nur im selben Netz. Internet, Hole-Punching und Opus sind in Arbeit, siehe `docs/INTERFACE-v2.md`.
+- Bis acht Teilnehmer. Ohne Raum unverschlüsselt.
 - WASAPI Shared Mode mit 10-ms-Perioden. Kleinere Perioden über
   `IAudioClient3` sind der nächste Schritt, wenn die Messung zeigt, dass es
   sich lohnt.
