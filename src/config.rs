@@ -32,6 +32,8 @@ pub struct Config {
     pub room_password: String,
     /// Vermittler „host:port“ für Räume über das Internet; leer = nur LAN
     pub hub: String,
+    /// Qualität für Ferne: pcm, opus64, opus32, opus16
+    pub codec: String,
     #[serde(rename = "in")]
     pub input: Option<String>,
     #[serde(rename = "out")]
@@ -61,6 +63,7 @@ impl Default for Config {
             room: String::new(),
             room_password: String::new(),
             hub: "168.119.111.164:4712".into(),
+            codec: "opus32".into(),
             input: None,
             output: None,
             peers: Vec::new(),

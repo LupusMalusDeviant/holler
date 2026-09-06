@@ -26,6 +26,7 @@ pub const PATH_V4: u8 = 3;
 pub const PATH_RELAY: u8 = 4;
 
 pub const CODEC_PCM: u8 = 0;
+pub const CODEC_OPUS: u8 = 1;
 
 pub fn db_to_lin(db: f32) -> f32 {
     10f32.powf(db / 20.0)
@@ -83,6 +84,8 @@ pub struct Peer {
     pub addr: Mutex<Option<SocketAddr>>,
     pub path: AtomicU8,
     pub codec: AtomicU8,
+    /// Bitrate des empfangenen Opus-Stroms in kbit/s (0 bei PCM)
+    pub codec_kbps: AtomicU32,
     pub frame_samples: AtomicU32,
     pub volume: AtomicU32,
     pub local_mute: AtomicBool,
@@ -117,6 +120,7 @@ impl Peer {
             addr: Mutex::new(None),
             path: AtomicU8::new(PATH_UNKNOWN),
             codec: AtomicU8::new(CODEC_PCM),
+            codec_kbps: AtomicU32::new(0),
             frame_samples: AtomicU32::new(240),
             volume: AtomicU32::new(1.0f32.to_bits()),
             local_mute: AtomicBool::new(false),
@@ -159,6 +163,7 @@ impl Peer {
         self.last_probe_ms.store(0, Relaxed);
         self.path.store(path, Relaxed);
         self.codec.store(CODEC_PCM, Relaxed);
+        self.codec_kbps.store(0, Relaxed);
         self.volume.store(volume.to_bits(), Relaxed);
         self.local_mute.store(false, Relaxed);
         self.remote_muted.store(false, Relaxed);
@@ -223,6 +228,9 @@ pub struct Shared {
     pub denoise: AtomicBool,
     pub spk_level: AtomicU32,
     pub tx_seq: AtomicU32,
+    pub tx_seq_opus: AtomicU32,
+    /// Eigene Sendequalität für Ferne: 0 = PCM, sonst Opus-Bitrate in kbit/s
+    pub codec_kbps: AtomicU32,
     pub frame_samples: AtomicU32,
     pub default_volume: AtomicU32,
     pub jitter_auto: AtomicBool,
@@ -278,6 +286,8 @@ impl Shared {
             denoise: AtomicBool::new(denoise),
             spk_level: AtomicU32::new(0),
             tx_seq: AtomicU32::new(0),
+            tx_seq_opus: AtomicU32::new(0),
+            codec_kbps: AtomicU32::new(32),
             frame_samples: AtomicU32::new(frame_samples),
             default_volume: AtomicU32::new((default_volume_percent as f32 / 100.0).to_bits()),
             jitter_auto: AtomicBool::new(auto),
@@ -480,10 +490,11 @@ impl Shared {
         let mut peers = Vec::new();
         for p in self.peers.iter().filter(|p| p.active.load(Relaxed)) {
             peers.push(format!(
-                "{}{}[{} rtt{:.0} jit{:.0} buf{}/{:.0}ms und{} drop{} {}]",
+                "{}{}[{} {} rtt{:.0} jit{:.0} buf{}/{:.0}ms und{} drop{} {}]",
                 if p.streaming(now) { "●" } else { "○" },
                 p.name(),
                 path_name(p.path.load(Relaxed)),
+                if p.codec.load(Relaxed) == CODEC_OPUS { format!("opus{}", p.codec_kbps.load(Relaxed)) } else { "pcm".to_string() },
                 p.rtt_us.load(Relaxed) as f32 / 2000.0,
                 p.jitter_us.load(Relaxed) as f32 / 1000.0,
                 p.target_frames.load(Relaxed),

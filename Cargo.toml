@@ -1,6 +1,6 @@
 [package]
 name = "holler"
-version = "0.4.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Lupus Malus Deviant"]
 description = "Holler: LAN-Funk ohne Umwege. Rohes PCM per UDP, ein Fenster, eine Exe."
@@ -24,6 +24,7 @@ chacha20poly1305 = "0.10"
 argon2 = "0.5"
 blake3 = "1"
 rand = "0.8"
+opus-pure = "0.2"
 
 [build-dependencies]
 winresource = "0.1"

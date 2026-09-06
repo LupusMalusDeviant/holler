@@ -94,6 +94,14 @@ Hintergrund weiter. Die Teilnehmerliste zeigt pro Person den aktiven Weg:
 „LAN direkt“, „direkt IPv6“, „direkt IPv4“ oder „Relay“. Der Hub sieht nie
 Klartext, er kennt nur Raum-ID und Adressen.
 
+**Qualität für Ferne.** Im Raum-Kasten wählbar, mit Erklärzeile: Rohes PCM
+(768 kbit/s je Stimme, nur bei sehr gutem Upload), Opus 64 (von PCM nicht zu
+unterscheiden), Opus 32 (Vorgabe, wie Discord), Opus 16 (Telefon, für
+Mobilfunk). Gilt für das eigene Senden an alle ausserhalb des LAN; im LAN
+bleibt es immer rohes PCM ohne Codec-Verzögerung. Opus ist reines Rust
+(`opus-pure`), 10-ms-Rahmen, mit Verlustverschleierung bei fehlenden Paketen.
+Die Teilnehmerliste zeigt, was ankommt: „PCM“ oder „Opus 32 kbit/s“.
+
 IPv4 und IPv6 laufen gleichzeitig; die Suche per Broadcast ist IPv4, eine
 IPv6-Adresse kann unter „IP manuell“ eingetragen werden (`[fe80::1]:4711`).
 
@@ -114,7 +122,8 @@ startet das Programm direkt im Tray.
 ## Optionen
 
 ```
-holler [--room <name> --room-password <text>] [--hub <host:port>|off] [--name <text>]
+holler [--room <name> --room-password <text>] [--hub <host:port>|off] [--codec pcm|opus64|opus32|opus16]
+       [--name <text>]
        [--peer <ip[:port]>]... [--port 4711] [--in <name|index>] [--out <name|index>]
        [--frame 5|10] [--jitter auto|1..8] [--volume 0..300]
        [--mic-gain 0..30] [--gate 0.05..0.95|off] [--denoise on|off]
@@ -205,7 +214,7 @@ Leute die Exe herunterladen sollen.
 
 ## Grenzen
 
-- Über das Internet noch mit rohem PCM (768 kbit/s je Stimme); Opus kommt in Phase 3, siehe `docs/INTERFACE-v2.md`.
+- Rohes PCM über das Internet braucht rund 1 Mbit/s Upload je Person, die einen hört; sonst Opus wählen.
 - Bis acht Teilnehmer. Ohne Raum unverschlüsselt.
 - WASAPI Shared Mode mit 10-ms-Perioden. Kleinere Perioden über
   `IAudioClient3` sind der nächste Schritt, wenn die Messung zeigt, dass es

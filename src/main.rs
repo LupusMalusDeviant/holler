@@ -6,6 +6,7 @@
 #![windows_subsystem = "windows"]
 
 mod audio;
+mod codec;
 mod config;
 mod crypto;
 mod engine;
@@ -45,6 +46,9 @@ struct Args {
     /// Testschalter: Direktwege ignorieren, alles über den Hub
     #[arg(long = "force-relay")]
     force_relay: bool,
+    /// Qualität für Ferne: pcm, opus64, opus32, opus16
+    #[arg(long)]
+    codec: Option<String>,
     /// Anzeigename bei den anderen
     #[arg(long)]
     name: Option<String>,
@@ -106,6 +110,7 @@ fn main() {
     if let Some(v) = &args.room { cfg.room = v.clone(); }
     if let Some(v) = &args.room_password { cfg.room_password = v.clone(); }
     if let Some(v) = &args.hub { cfg.hub = if v.trim().eq_ignore_ascii_case("off") { String::new() } else { v.clone() }; }
+    if let Some(v) = &args.codec { cfg.codec = codec::choice_key(codec::parse_choice(v)).to_string(); }
     if let Some(v) = args.name { cfg.name = v; }
     if let Some(v) = args.input { cfg.input = Some(v); }
     if let Some(v) = args.output { cfg.output = Some(v); }
@@ -176,6 +181,7 @@ fn main() {
     );
 
     shared.set_hub(&cfg.hub);
+    shared.codec_kbps.store(codec::parse_choice(&cfg.codec), std::sync::atomic::Ordering::Relaxed);
     shared.force_relay.store(args.force_relay, std::sync::atomic::Ordering::Relaxed);
     if let Some(e) = shared.hub_error.lock().ok().and_then(|g| g.clone()) {
         eprintln!("{e}");

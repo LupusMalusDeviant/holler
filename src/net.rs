@@ -14,8 +14,9 @@
 //!   PING   13  an den Hub, kommt als PONG zurück
 //! Flags: Bit 0 Sender stumm (dann keine Samples), Bit 2 Nutzlast verschlüsselt.
 
+use crate::codec;
 use crate::crypto::ROOM_ID_LEN;
-use crate::state::{classify, Shared, MAX_PEERS, MAX_TARGET, MIN_TARGET, PATH_LAN, PATH_RELAY, PATH_V6, RATE};
+use crate::state::{classify, Shared, CODEC_OPUS, CODEC_PCM, MAX_PEERS, MAX_TARGET, MIN_TARGET, PATH_LAN, PATH_RELAY, PATH_V6, RATE};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
@@ -43,6 +44,8 @@ const MAX_GAP_FILL: u32 = 8;
 const RELAY_AFTER_MS: u64 = 2000;
 /// Direktweg gilt als tot, wenn so lange kein PROBE-ACK kam.
 const DIRECT_DEAD_MS: u64 = 15_000;
+/// Opus-Pakete nutzen den oberen Sequenzraum, damit die Nonce je Schlüssel eindeutig bleibt.
+const SEQ_OPUS: u32 = 0x8000_0000;
 
 #[derive(Clone, Copy)]
 struct Header {
@@ -193,34 +196,27 @@ pub struct Wire {
     shared: Arc<Shared>,
     buf: Vec<u8>,
     relay: Vec<u8>,
+    encoder: Option<codec::Encoder>,
+    opus_acc: Vec<i16>,
+    opus_pkt: Vec<u8>,
 }
 
 impl Wire {
     pub fn new(sockets: Arc<Sockets>, shared: Arc<Shared>) -> Self {
-        Wire { sockets, shared, buf: Vec::with_capacity(HEADER + 2 + 2 * 1024 + 16), relay: Vec::with_capacity(HEADER + 8 + 2 * 1024 + 40) }
+        Wire {
+            sockets,
+            shared,
+            buf: Vec::with_capacity(HEADER + 2 + 2 * 1024 + 16),
+            relay: Vec::with_capacity(HEADER + 8 + 2 * 1024 + 40),
+            encoder: None,
+            opus_acc: Vec::with_capacity(codec::FRAME * 2),
+            opus_pkt: Vec::with_capacity(codec::MAX_PACKET),
+        }
     }
 
-    pub fn send_frame(&mut self, samples: &[i16]) {
-        let seq = self.shared.tx_seq.fetch_add(1, Relaxed);
-        let mut direct: [Option<SocketAddr>; MAX_PEERS] = [None; MAX_PEERS];
-        let mut relayed: [Option<u64>; MAX_PEERS] = [None; MAX_PEERS];
-        let mut any = false;
-        for (i, p) in self.shared.peers.iter().enumerate() {
-            if !p.active.load(Relaxed) {
-                continue;
-            }
-            if p.via_relay.load(Relaxed) {
-                relayed[i] = Some(p.id.load(Relaxed));
-                any = true;
-            } else if let Ok(a) = p.addr.try_lock() {
-                direct[i] = *a;
-                any |= a.is_some();
-            }
-        }
-        if !any {
-            return;
-        }
-        let muted = self.shared.muted.load(Relaxed);
+    /// Baut ein AUDIO-Paket in `self.buf` und verschickt es an die Ziele (direkt und per Relay).
+    #[allow(clippy::too_many_arguments)]
+    fn ship(&mut self, seq: u32, muted: bool, payload_head: &[u8], data: Option<&[u8]>, direct: &[Option<SocketAddr>], relayed: &[Option<u64>]) {
         let room = self.shared.room.try_read().ok().and_then(|r| r.clone());
         let mut flags = if muted { F_MUTED } else { 0 };
         if room.is_some() {
@@ -229,14 +225,10 @@ impl Wire {
         let h = Header { typ: T_AUDIO, flags, sender: self.shared.peer_id, seq, ts: self.shared.now_us() };
         self.buf.clear();
         write_header(&mut self.buf, &h);
-        let frame_ms = (samples.len() as u32 * 1000 / RATE) as u8;
-        let mut payload = Vec::with_capacity(2 + 2 * samples.len() + 16);
-        payload.push(crate::state::CODEC_PCM);
-        payload.push(frame_ms);
-        if !muted {
-            for s in samples {
-                payload.extend_from_slice(&s.to_le_bytes());
-            }
+        let mut payload = Vec::with_capacity(payload_head.len() + data.map(|d| d.len()).unwrap_or(0) + 16);
+        payload.extend_from_slice(payload_head);
+        if let Some(d) = data {
+            payload.extend_from_slice(d);
         }
         if let Some(r) = &room {
             if !r.seal(&self.buf[..HEADER], &nonce(h.sender, h.seq), &mut payload) {
@@ -257,6 +249,77 @@ impl Wire {
                 self.sockets.send_to(&self.relay, hub);
             }
         }
+    }
+
+    /// Ein 5-ms-Rahmen vom Mikrofon. LAN-Peers bekommen ihn sofort als PCM;
+    /// für Ferne werden zwei Rahmen zu 10 ms Opus gebündelt (oder PCM, wenn so gewählt).
+    pub fn send_frame(&mut self, samples: &[i16]) {
+        let kbps = self.shared.codec_kbps.load(Relaxed);
+        let mut pcm_direct: [Option<SocketAddr>; MAX_PEERS] = [None; MAX_PEERS];
+        let mut pcm_relay: [Option<u64>; MAX_PEERS] = [None; MAX_PEERS];
+        let mut opus_direct: [Option<SocketAddr>; MAX_PEERS] = [None; MAX_PEERS];
+        let mut opus_relay: [Option<u64>; MAX_PEERS] = [None; MAX_PEERS];
+        let mut any_pcm = false;
+        let mut any_opus = false;
+        for (i, p) in self.shared.peers.iter().enumerate() {
+            if !p.active.load(Relaxed) {
+                continue;
+            }
+            let lan = p.path.load(Relaxed) == PATH_LAN;
+            let use_pcm = lan || kbps == 0;
+            if p.via_relay.load(Relaxed) {
+                let id = p.id.load(Relaxed);
+                if use_pcm {
+                    pcm_relay[i] = Some(id);
+                    any_pcm = true;
+                } else {
+                    opus_relay[i] = Some(id);
+                    any_opus = true;
+                }
+            } else if let Ok(a) = p.addr.try_lock() {
+                if let Some(a) = *a {
+                    if use_pcm {
+                        pcm_direct[i] = Some(a);
+                        any_pcm = true;
+                    } else {
+                        opus_direct[i] = Some(a);
+                        any_opus = true;
+                    }
+                }
+            }
+        }
+        let muted = self.shared.muted.load(Relaxed);
+        if any_pcm {
+            let seq = self.shared.tx_seq.fetch_add(1, Relaxed) & !SEQ_OPUS;
+            let frame_ms = (samples.len() as u32 * 1000 / RATE) as u8;
+            let mut data = Vec::with_capacity(2 * samples.len());
+            if !muted {
+                for s in samples {
+                    data.extend_from_slice(&s.to_le_bytes());
+                }
+            }
+            self.ship(seq, muted, &[CODEC_PCM, frame_ms], Some(&data), &pcm_direct, &pcm_relay);
+        }
+        if !any_opus {
+            self.opus_acc.clear();
+            return;
+        }
+        self.opus_acc.extend_from_slice(samples);
+        if self.opus_acc.len() < codec::FRAME {
+            return;
+        }
+        if self.encoder.is_none() {
+            self.encoder = codec::Encoder::new(kbps);
+        }
+        let Some(enc) = self.encoder.as_mut() else { return };
+        enc.set_kbps(kbps);
+        let ok = if muted { false } else { enc.encode(&self.opus_acc[..codec::FRAME], &mut self.opus_pkt) };
+        self.opus_acc.drain(..codec::FRAME);
+        let seq = SEQ_OPUS | (self.shared.tx_seq_opus.fetch_add(1, Relaxed) & !SEQ_OPUS);
+        let head = [CODEC_OPUS, 10, kbps.min(255) as u8];
+        let pkt = std::mem::take(&mut self.opus_pkt);
+        self.ship(seq, muted || !ok, &head, if ok { Some(&pkt) } else { None }, &opus_direct, &opus_relay);
+        self.opus_pkt = pkt;
     }
 }
 
@@ -308,6 +371,8 @@ struct Slot {
     producer: rtrb::Producer<i16>,
     capacity: usize,
     rx: Rx,
+    decoder: Option<codec::Decoder>,
+    codec: u8,
 }
 
 /// Empfangsseite aller Plätze; nur die Netz-Threads sperren hier.
@@ -321,7 +386,7 @@ impl Table {
             .into_iter()
             .map(|p| {
                 let capacity = p.buffer().capacity();
-                Slot { producer: p, capacity, rx: Rx::new(frame) }
+                Slot { producer: p, capacity, rx: Rx::new(frame), decoder: None, codec: CODEC_PCM }
             })
             .collect();
         Arc::new(Mutex::new(Table { slots }))
@@ -554,6 +619,8 @@ fn peer_slot(shared: &Shared, table: &mut Table, id: u64, name: &str, addr: Opti
     let path = addr.map(|a| classify(a.ip())).unwrap_or(crate::state::PATH_UNKNOWN);
     shared.peers[i].assign(id, name, addr, path, now, shared.initial_target(), shared.default_volume_f());
     table.slots[i].rx.reset(shared.frame_samples.load(Relaxed) as usize, now);
+    table.slots[i].decoder = None;
+    table.slots[i].codec = CODEC_PCM;
     shared.room_full.store(false, Relaxed);
     eprintln!(
         "Teilnehmer {name} auf Platz {i}, {}",
@@ -727,9 +794,10 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
                     return;
                 }
             }
-            if payload.len() < 2 || payload[0] != crate::state::CODEC_PCM {
+            if payload.len() < 2 || (payload[0] != CODEC_PCM && payload[0] != CODEC_OPUS) {
                 return;
             }
+            let in_codec = payload[0];
             let Some(i) = peer_slot(shared, table, h.sender, "", if from_hub { None } else { Some(src) }, now_ms) else {
                 shared.room_full.store(true, Relaxed);
                 return;
@@ -764,9 +832,42 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
             }
 
             let slot = &mut table.slots[i];
+            if slot.codec != in_codec {
+                // Codec-Wechsel: eigener Sequenzraum, daher Zähler neu ansetzen.
+                slot.codec = in_codec;
+                slot.rx.last_seq = None;
+                slot.rx.last_frame.clear();
+                p.codec.store(in_codec, Relaxed);
+            }
+            let mut decoded: Vec<i16> = Vec::new();
+            let samples: &[i16] = if in_codec == CODEC_OPUS {
+                if payload.len() < 3 {
+                    return;
+                }
+                p.codec_kbps.store(payload[2] as u32, Relaxed);
+                if slot.decoder.is_none() {
+                    slot.decoder = codec::Decoder::new();
+                }
+                let Some(dec) = slot.decoder.as_mut() else { return };
+                if !muted && payload.len() > 3 {
+                    if !dec.decode(&payload[3..], &mut decoded) {
+                        return;
+                    }
+                }
+                &decoded
+            } else {
+                p.codec_kbps.store(0, Relaxed);
+                &[]
+            };
             let rx = &mut slot.rx;
-            let samples = &payload[2..];
-            let ns = if muted { rx.last_ns } else { samples.len() / 2 };
+            let raw = &payload[2..];
+            let ns = if muted {
+                if in_codec == CODEC_OPUS { codec::FRAME } else { rx.last_ns }
+            } else if in_codec == CODEC_OPUS {
+                samples.len()
+            } else {
+                raw.len() / 2
+            };
             if ns == 0 {
                 return;
             }
@@ -792,8 +893,13 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
                     let gap = (d - 1) as u32;
                     rx.gaps.push_back((now_ms, gap));
                     if gap <= MAX_GAP_FILL {
+                        let mut plc: Vec<i16> = Vec::new();
                         for g in 0..gap {
-                            if g == 0 && !rx.last_frame.is_empty() {
+                            if in_codec == CODEC_OPUS && g < 2 && slot.decoder.as_mut().is_some_and(|d| d.conceal(&mut plc)) {
+                                for &s in &plc {
+                                    let _ = slot.producer.push(s);
+                                }
+                            } else if g == 0 && !rx.last_frame.is_empty() {
                                 for &s in &rx.last_frame {
                                     let _ = slot.producer.push(s / 2);
                                 }
@@ -812,7 +918,9 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
             let target = p.target_frames.load(Relaxed) as usize;
             let fill = slot.capacity - slot.producer.slots();
             rx.min_fill = rx.min_fill.min(fill);
-            if fill + ns > (target + 2) * ns {
+            // Überlauf erst deutlich über dem Ziel: Jitter-Schübe sollen den Puffer
+            // wachsen lassen, nicht Pakete kosten. Zurückgeregelt wird per Drift-Skip.
+            if fill + ns > (target + 4) * ns {
                 p.dropped.fetch_add(1, Relaxed);
                 return;
             }
@@ -821,8 +929,13 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
                 for _ in 0..ns {
                     let _ = slot.producer.push(0);
                 }
+            } else if in_codec == CODEC_OPUS {
+                for &s in samples {
+                    rx.last_frame.push(s);
+                    let _ = slot.producer.push(s);
+                }
             } else {
-                for c in samples.chunks_exact(2) {
+                for c in raw.chunks_exact(2) {
                     let s = i16::from_le_bytes([c[0], c[1]]);
                     rx.last_frame.push(s);
                     let _ = slot.producer.push(s);

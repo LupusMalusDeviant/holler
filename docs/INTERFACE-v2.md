@@ -243,3 +243,11 @@ protokollinkompatibel zu 0.2, also beide Rechner gleichzeitig aktualisieren
    öffentliche Adresse im Fenster. Gemessen von hier: Hub 23 ms Laufzeit, Relay
    mit 6 ms Jitter und 3–4 Rahmen Puffer. Hub-Domain (z. B.
    `holler.app.lupusmalus.dev`) noch nicht angelegt, Vorgabe ist die IP.
+7. **Phase 3 umgesetzt als Version 1.0.0** (6. September 2026): Opus über
+   `opus-pure` (reines Rust, bitgenau zu libopus), 10-ms-Rahmen, VoIP-Profil,
+   Qualität wählbar im Fenster mit Erklärzeile (PCM / 64 / 32 / 16 kbit/s),
+   LAN-Peers immer PCM. Getrennte Sequenzräume für PCM und Opus (oberes Bit),
+   damit die Nonce je Schlüssel eindeutig bleibt; Codec-Wechsel setzt den
+   Sequenzzähler des Empfängers neu. Verlustverschleierung des Dekoders für
+   bis zu zwei fehlende Rahmen. Puffer-Überlaufgrenze auf Ziel + 4 Rahmen
+   erweitert, weil Jitter-Schübe im Internet sonst Pakete kosteten.

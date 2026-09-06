@@ -2119,7 +2119,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
 name = "holler"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "argon2",
  "blake3",
@@ -2129,6 +2129,7 @@ dependencies = [
  "eframe",
  "global-hotkey",
  "nnnoiseless",
+ "opus-pure",
  "rand",
  "raw-window-handle",
  "rtrb",
@@ -3172,6 +3173,12 @@ name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "04744f49eae99ab78e0d5c0b603ab218f515ea8cfe5a456d7629ad883a3b6e7d"
+
+[[package]]
+name = "opus-pure"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "de6a3cef053e1fdea38a5e50edb0789590a31184c5a59f6cd5e462fe844793e7"
 
 [[package]]
 name = "orbclient"

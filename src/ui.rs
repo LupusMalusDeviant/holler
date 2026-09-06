@@ -1,11 +1,12 @@
 //! Das eine Fenster. Liest nur Atomics, zeichnet mit 30 Hz.
 //! Kopfzeile mit Status, Karten Raum, Teilnehmer, Mikrofon, Ausgabe, darunter der Live/Stumm-Knopf.
 
+use crate::codec;
 use crate::config::Config;
 use crate::crypto;
 use crate::engine::Engine;
 use crate::net;
-use crate::state::{lin_to_db, path_name, Shared, MAX_PEERS, MAX_TARGET};
+use crate::state::{lin_to_db, path_name, Shared, CODEC_OPUS, MAX_PEERS, MAX_TARGET};
 use crate::tray;
 use crate::update::{self, State as UpState, Updater};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
@@ -45,6 +46,7 @@ pub struct App {
     peer_edit: String,
     peer_error: Option<String>,
     hub_edit: String,
+    codec_choice: u32,
     meters: Vec<Meter>,
     updater: Arc<Updater>,
 }
@@ -101,6 +103,7 @@ impl App {
             peer_edit: String::new(),
             peer_error: None,
             hub_edit: cfg.hub.clone(),
+            codec_choice: codec::parse_choice(&cfg.codec),
             meters: (0..MAX_PEERS + 2).map(|_| Meter::new()).collect(),
             updater,
             shared,
@@ -474,6 +477,26 @@ impl eframe::App for App {
                         ui.label(RichText::new(hub_text.1).color(hub_text.0).size(12.0));
                     });
                     ui.horizontal(|ui| {
+                        ui.label(RichText::new("Qualität für Ferne").color(MUTED_TEXT));
+                        let before = self.codec_choice;
+                        egui::ComboBox::from_id_salt("codec")
+                            .width(150.0)
+                            .selected_text(codec::choice_label(self.codec_choice))
+                            .show_ui(ui, |ui| {
+                                for (k, label, _) in codec::CHOICES {
+                                    ui.selectable_value(&mut self.codec_choice, k, label);
+                                }
+                            });
+                        if before != self.codec_choice {
+                            s.codec_kbps.store(self.codec_choice, Relaxed);
+                            self.cfg.codec = codec::choice_key(self.codec_choice).to_string();
+                            self.cfg.save();
+                        }
+                        let expl = codec::CHOICES.iter().find(|c| c.0 == self.codec_choice).map(|c| c.2).unwrap_or("");
+                        ui.label(RichText::new(expl).color(MUTED_TEXT).size(11.5));
+                    });
+                    ui.label(RichText::new("Gilt für das eigene Senden an alle, die nicht im selben Netz sind. Im LAN geht immer rohes PCM.").color(MUTED_TEXT).size(11.0));
+                    ui.horizontal(|ui| {
                         ui.label(RichText::new("IP manuell").color(MUTED_TEXT));
                         let r = ui.add(egui::TextEdit::singleline(&mut self.peer_edit).desired_width(170.0).hint_text("192.168.1.5 oder [fe80::1]:4711"));
                         let go = ui.button("Hinzufügen").clicked() || (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
@@ -551,8 +574,9 @@ impl eframe::App for App {
                             let name = p.name();
                             ui.label(RichText::new(if name.is_empty() { "…".to_string() } else { name }).size(14.0).strong());
                             let m = if p.remote_muted.load(Relaxed) { " · stumm" } else { "" };
+                            let codec_text = if p.codec.load(Relaxed) == CODEC_OPUS { format!("Opus {} kbit/s", p.codec_kbps.load(Relaxed)) } else { "PCM".to_string() };
                             let info = format!(
-                                "{} · {:.1} ms · Jitter {:.0} · Puffer {}/{:.0} ms · PCM{m}",
+                                "{} · {:.1} ms · Jitter {:.0} · Puffer {}/{:.0} ms · {codec_text}{m}",
                                 path_name(p.path.load(Relaxed)),
                                 p.rtt_us.load(Relaxed) as f32 / 2000.0,
                                 p.jitter_us.load(Relaxed) as f32 / 1000.0,
