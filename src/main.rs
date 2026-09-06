@@ -15,6 +15,10 @@ mod invite;
 mod net;
 mod single;
 mod state;
+#[cfg(windows)]
+mod tray;
+#[cfg(not(windows))]
+#[path = "tray_unix.rs"]
 mod tray;
 mod ui;
 mod update;
@@ -111,6 +115,7 @@ struct Args {
 }
 
 fn main() {
+    #[cfg(windows)]
     unsafe {
         windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
     }

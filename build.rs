@@ -12,6 +12,9 @@ fn main() {
     // Kopie ins Repo, damit sie auch ausserhalb des Builds verwendbar ist.
     let _ = std::fs::create_dir_all("assets");
     let _ = std::fs::write("assets/holler.ico", icon::ico(&[16, 24, 32, 48, 64, 128, 256], icon::GREEN));
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
     winresource::WindowsResource::new()
         .set_icon(ico.to_str().expect("Pfad"))
         .set("ProductName", "Holler")

@@ -1,14 +1,14 @@
-# Baut Holler bei jedem Versions-Tag (v1.2.3) auf einem Windows-Läufer, signiert
-# Exe und Installer, wenn die Secrets SIGN_PFX_BASE64 und SIGN_PFX_PASSWORD
-# gesetzt sind, und hängt alles an ein GitHub-Release.
+# Baut Holler bei jedem Versions-Tag (v1.2.3): Windows mit Signatur und Installer,
+# dazu Linux und macOS als Archive (unsigniert), und hängt alles an ein GitHub-Release.
+# Tests laufen vor jedem Bau.
 #
-# Secrets setzen (einmalig, lokal):
+# Secrets (einmalig, lokal):
 #   powershell -Command "gh secret set SIGN_PFX_BASE64 --body ([Convert]::ToBase64String([IO.File]::ReadAllBytes('dist\LupusMalusDeviant.pfx')))"
 #   gh secret set SIGN_PFX_PASSWORD
 #
 # Neues Release: Version in Cargo.toml erhöhen, committen, dann
-#   git tag v0.2.0 && git push origin v0.2.0
-# Handstart ohne Tag (workflow_dispatch) baut nur ein Artefakt.
+#   git tag v1.2.0 && git push origin v1.2.0
+# Handstart ohne Tag (workflow_dispatch) baut nur Artefakte.
 
 name: release
 
@@ -21,7 +21,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,8 +42,11 @@ jobs:
           }
           Write-Host "Version $ver"
 
+      - name: Tests
+        run: cargo test --release --workspace
+
       - name: Bauen
-        run: cargo build --release
+        run: cargo build --release --workspace
 
       - name: Signatur vorbereiten
         id: sign
@@ -110,9 +113,11 @@ jobs:
           Compress-Archive -Path out\holler.exe, out\LupusMalusDeviant.cer, out\vertrauen.cmd -DestinationPath out\holler-$ver-portable.zip
           $signed = "${{ steps.sign.outputs.enabled }}" -eq "true"
           $notes = @()
-          $notes += "**Installieren (empfohlen)**: ``Holler-Setup-$ver.exe`` starten. Pro Benutzer, ohne Adminrechte, mit Startmenü-Eintrag, optional Autostart im Tray. Künftige Versionen meldet Holler selbst und installiert sie auf Klick."
+          $notes += "**Windows, installieren (empfohlen)**: ``Holler-Setup-$ver.exe`` starten. Pro Benutzer, ohne Adminrechte, mit Startmenü-Eintrag, optional Autostart im Tray. Künftige Versionen meldet Holler selbst und installiert sie auf Klick."
           $notes += ""
-          $notes += "**Portabel**: ``holler.exe`` aus ``holler-$ver-portable.zip`` irgendwohin kopieren und starten."
+          $notes += "**Windows, portabel**: ``holler.exe`` aus ``holler-$ver-portable.zip`` irgendwohin kopieren und starten."
+          $notes += ""
+          $notes += "**Linux / macOS**: ``holler-$ver-linux-x64.tar.gz`` bzw. ``holler-$ver-macos-arm64.tar.gz`` entpacken, ``holler`` starten. Ohne Tray und ohne Installer; unsigniert (macOS: Rechtsklick → Öffnen beim ersten Start). Enthält auch ``holler-hub`` für den eigenen Vermittler."
           $notes += ""
           $notes += "**Dateien**"
           $notes += "- ``Holler-Setup-$ver.exe``: Installer" + $(if ($signed) { ", signiert mit dem Zertifikat Lupus Malus Deviant" } else { " (**unsigniert**, Signatur-Secrets fehlen)" })
@@ -140,5 +145,64 @@ jobs:
         if: ${{ !startsWith(github.ref, 'refs/tags/') }}
         uses: actions/upload-artifact@v4
         with:
-          name: holler-${{ steps.ver.outputs.version }}
+          name: holler-${{ steps.ver.outputs.version }}-windows
           path: out/
+
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: linux-x64
+          - os: macos-latest
+            label: macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Systembibliotheken (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev libxdo-dev
+
+      - name: Version lesen
+        id: ver
+        shell: bash
+        run: |
+          ver=$(grep -m1 -E '^version\s*=' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "Version $ver"
+
+      - name: Tests
+        run: cargo test --release --workspace
+
+      - name: Bauen
+        run: cargo build --release --workspace
+
+      - name: Archiv
+        shell: bash
+        run: |
+          ver="${{ steps.ver.outputs.version }}"
+          mkdir -p out/holler-$ver
+          cp target/release/holler target/release/holler-hub README.md out/holler-$ver/
+          tar -C out -czf "out/holler-$ver-${{ matrix.label }}.tar.gz" "holler-$ver"
+          ls -la out
+
+      - name: Ans Release hängen
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/holler-${{ steps.ver.outputs.version }}-${{ matrix.label }}.tar.gz
+
+      - name: Artefakt (Handstart ohne Tag)
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: holler-${{ steps.ver.outputs.version }}-${{ matrix.label }}
+          path: out/*.tar.gz

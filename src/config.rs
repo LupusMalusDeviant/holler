@@ -55,7 +55,7 @@ impl Default for Config {
             frame_ms: 5,
             jitter: "auto".into(),
             volume: 100,
-            name: std::env::var("COMPUTERNAME").unwrap_or_else(|_| "holler".into()),
+            name: host_name(),
             hotkey: "F9".into(),
             headset_ms: 40,
             mic_gain_db: 12.0,
@@ -80,8 +80,36 @@ impl Default for Config {
 pub const DEFAULT_HUB: &str = "holler.app.lupusmalus.dev:4712";
 const OLD_HUB_IP: &str = "168.119.111.164:4712";
 
+/// Rechnername als Vorgabe für den Anzeigenamen.
+pub fn host_name() -> String {
+    if let Ok(n) = std::env::var("COMPUTERNAME") {
+        return n;
+    }
+    if let Ok(n) = std::env::var("HOSTNAME") {
+        return n;
+    }
+    if let Ok(out) = std::process::Command::new("hostname").output() {
+        let n = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !n.is_empty() {
+            return n;
+        }
+    }
+    "holler".into()
+}
+
+/// Konfigurationsdatei: Windows %APPDATA%\holler, macOS ~/Library/Application Support/holler,
+/// Linux $XDG_CONFIG_HOME/holler bzw. ~/.config/holler.
 pub fn default_path() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("holler").join("config.toml"))
+    let dir = if cfg!(windows) {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library").join("Application Support"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+    };
+    dir.map(|d| d.join("holler").join("config.toml"))
 }
 
 impl Config {

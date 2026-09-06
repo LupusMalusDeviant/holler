@@ -1,17 +1,20 @@
 //! Nur eine Instanz je Port. Ein zweiter Start holt das Fenster der ersten nach
 //! vorn und übergibt ihr, falls vorhanden, einen Einladungslink über eine Datei.
+//! Unter Linux/macOS gibt es keinen Fensterwächter; dort scheitert die zweite
+//! Instanz am belegten Port, die Link-Übergabe funktioniert trotzdem.
 
 use std::path::PathBuf;
-use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
-use windows_sys::Win32::System::Threading::CreateMutexW;
-use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
 
+#[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// true = wir sind die erste Instanz. Der Mutex bleibt bis zum Prozessende bestehen.
+#[cfg(windows)]
 pub fn acquire(port: u16) -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
     let name = wide(&format!("Local\\Holler-{port}"));
     let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
     if h.is_null() {
@@ -22,8 +25,16 @@ pub fn acquire(port: u16) -> bool {
     !exists
 }
 
+#[cfg(not(windows))]
+pub fn acquire(port: u16) -> bool {
+    // Ist der Port belegt, läuft schon eine Instanz.
+    std::net::UdpSocket::bind(("0.0.0.0", port)).is_ok()
+}
+
 /// Fenster der laufenden Instanz nach vorn holen.
+#[cfg(windows)]
 pub fn show_existing() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FindWindowW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW};
     for title in ["Holler", "Holler — STUMM"] {
         let t = wide(title);
         let hwnd = unsafe { FindWindowW(std::ptr::null(), t.as_ptr()) };
@@ -37,6 +48,9 @@ pub fn show_existing() {
         }
     }
 }
+
+#[cfg(not(windows))]
+pub fn show_existing() {}
 
 /// Übergabedatei für Einladungslinks an die laufende Instanz.
 pub fn join_file() -> Option<PathBuf> {

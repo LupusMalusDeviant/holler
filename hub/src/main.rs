@@ -138,13 +138,40 @@ fn members_packet(room_id_hint: u8, room: &Room) -> Vec<u8> {
     buf
 }
 
+/// Healthcheck: PING an den laufenden Hub, PONG binnen 2 s erwartet.
+fn health_check(port: u16) -> bool {
+    // Linux: [::] ist dual-stack, ::1 reicht. Windows lauscht so nur auf IPv6; deshalb beide versuchen.
+    for (bind, target) in [("[::1]:0", IpAddr::V6(Ipv6Addr::LOCALHOST)), ("127.0.0.1:0", IpAddr::V4(Ipv4Addr::LOCALHOST))] {
+        let Ok(s) = UdpSocket::bind(bind) else { continue };
+        let _ = s.set_read_timeout(Some(Duration::from_millis(1500)));
+        let mut ping = Vec::with_capacity(HEADER);
+        write_header(&mut ping, T_PING, 0xC0FFEE, 1);
+        if s.send_to(&ping, SocketAddr::new(target, port)).is_err() {
+            continue;
+        }
+        let mut buf = [0u8; 64];
+        if let Ok((n, _)) = s.recv_from(&mut buf) {
+            if n >= HEADER && buf[0..2] == MAGIC && buf[2] == T_PONG {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn main() {
     let mut port: u16 = 4712;
+    let mut check = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if a == "--port" {
             port = args.next().and_then(|p| p.parse().ok()).unwrap_or(4712);
+        } else if a == "--check" {
+            check = true;
         }
+    }
+    if check {
+        std::process::exit(if health_check(port) { 0 } else { 1 });
     }
     // Linux: [::] ist dual-stack, IPv4-Absender erscheinen als ::ffff:a.b.c.d.
     let socket = UdpSocket::bind(("::", port)).unwrap_or_else(|e| {

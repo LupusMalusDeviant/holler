@@ -9,6 +9,7 @@ RUN cargo build --release --locked 2>/dev/null || cargo build --release
 FROM debian:bookworm-slim
 COPY --from=build /src/hub/target/release/holler-hub /usr/local/bin/holler-hub
 EXPOSE 4712/udp
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD ["/usr/local/bin/holler-hub", "--check", "--port", "4712"]
 USER 65534:65534
 ENTRYPOINT ["/usr/local/bin/holler-hub"]
 CMD ["--port", "4712"]

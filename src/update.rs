@@ -97,6 +97,9 @@ impl Updater {
 
 /// Läuft Holler aus dem Installationsordner? Sonst ist es die portable Exe.
 pub fn is_installed() -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
     let Ok(exe) = std::env::current_exe() else { return false };
     let Some(local) = std::env::var_os("LOCALAPPDATA") else { return false };
     let root = std::path::PathBuf::from(local).join("Programs").join("Holler");

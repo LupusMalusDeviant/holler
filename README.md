@@ -36,6 +36,18 @@ Neue Versionen entstehen automatisch: Version in `Cargo.toml` erhöhen, committe
 Tag `v0.2.0` pushen. GitHub baut, signiert Exe und Installer und veröffentlicht
 (siehe `.github/workflows/release.yml`).
 
+## Linux und macOS
+
+Seit 1.2.0 liegen im Release auch `holler-x.y.z-linux-x64.tar.gz` und
+`holler-x.y.z-macos-arm64.tar.gz`: entpacken, `holler` starten. Unterschiede
+zu Windows: kein Tray (× beendet), kein Installer und kein Selbst-Update
+(Holler zeigt nur den Hinweis auf die neue Version), unsigniert (macOS:
+Rechtsklick → Öffnen beim ersten Start). Der Hotkey braucht unter Linux X11.
+Konfiguration liegt unter `~/.config/holler/config.toml` bzw.
+`~/Library/Application Support/holler/config.toml`. Beide Archive enthalten
+auch `holler-hub` für einen eigenen Vermittler. Zum Selbstbauen unter Ubuntu:
+`libasound2-dev libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev libgl1-mesa-dev pkg-config`.
+
 ## Bauen
 
 ```
@@ -178,7 +190,8 @@ Alles sitzt auf der Senderseite, jeder stellt also sein eigenes Mikrofon ein:
 
 Ein Rust-Programm ohne Abhängigkeiten in `hub/`, läuft als Docker-Container im
 Host-Netz auf dem Apps-Server (`/opt/holler/hub`, `docker compose up -d --build`).
-Ein UDP-Port 4712, IPv4 und IPv6. Kein Zustand auf Platte, keine Konten. Räume
+Ein UDP-Port 4712, IPv4 und IPv6. Docker-Healthcheck per PING/PONG (`holler-hub --check`),
+Whiskers überwacht Zustand und Protokoll. Kein Zustand auf Platte, keine Konten. Räume
 verfallen, sobald sie leer sind; Mitglieder ohne Lebenszeichen fliegen nach 15 s.
 Relay ist auf 1,5 MB/s je Mitglied begrenzt. Aktualisieren: auf dem Server
 `git pull` und `docker compose up -d --build`.

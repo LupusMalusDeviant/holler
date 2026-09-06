@@ -12,7 +12,6 @@ use crate::state::{lin_to_db, path_name, Shared, CODEC_OPUS, MAX_PEERS, MAX_TARG
 use crate::tray;
 use crate::update::{self, State as UpState, Updater};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -83,13 +82,19 @@ const METER_MIX: usize = MAX_PEERS + 1;
 
 impl App {
     pub fn new(shared: Arc<Shared>, engine: Engine, cfg: Config, cc: &eframe::CreationContext<'_>, start_hidden: bool, updater: Arc<Updater>) -> Self {
-        let hwnd = match cc.window_handle() {
-            Ok(h) => match h.as_raw() {
-                RawWindowHandle::Win32(w) => w.hwnd.get() as isize,
-                _ => 0,
-            },
-            Err(_) => 0,
+        #[cfg(windows)]
+        let hwnd = {
+            use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+            match cc.window_handle() {
+                Ok(h) => match h.as_raw() {
+                    RawWindowHandle::Win32(w) => w.hwnd.get() as isize,
+                    _ => 0,
+                },
+                Err(_) => 0,
+            }
         };
+        #[cfg(not(windows))]
+        let hwnd: isize = 0;
         let report = tray::init(shared.clone(), cc.egui_ctx.clone(), hwnd, &cfg.hotkey, start_hidden);
         let jitter_choice = if shared.jitter_auto.load(Relaxed) { 0 } else { shared.jitter_fixed.load(Relaxed) };
         App {
@@ -331,7 +336,7 @@ impl eframe::App for App {
         }
 
         // Schliessen = in den Tray, ausser das Tray-Menü hat „Beenden“ gewählt.
-        if ctx.input(|i| i.viewport().close_requested()) && !tray::quit_requested() {
+        if cfg!(windows) && ctx.input(|i| i.viewport().close_requested()) && !tray::quit_requested() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.cfg.save();
             tray::hide_window();
@@ -725,7 +730,11 @@ impl eframe::App for App {
                     tray::toggle_mute();
                 }
                 ui.add_space(6.0);
-                ui.label(RichText::new("× legt das Fenster ins Tray neben der Uhr (evtl. hinter dem Pfeil ^). Beenden über Rechtsklick auf das Tray-Symbol.").color(MUTED_TEXT).size(11.0));
+                if cfg!(windows) {
+                    ui.label(RichText::new("× legt das Fenster ins Tray neben der Uhr (evtl. hinter dem Pfeil ^). Beenden über Rechtsklick auf das Tray-Symbol.").color(MUTED_TEXT).size(11.0));
+                } else {
+                    ui.label(RichText::new("× beendet Holler. Kein Tray auf diesem System.").color(MUTED_TEXT).size(11.0));
+                }
                 let up_text = match self.updater.state() {
                     UpState::Off => "Update-Prüfung aus".to_string(),
                     UpState::Checking => "prüfe auf Updates …".to_string(),
