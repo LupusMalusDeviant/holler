@@ -1,0 +1,16 @@
+# Auf dem Server:  cd /opt/holler/hub && docker compose up -d --build
+# Host-Netz statt Portweiterleitung: Dockers Userland-Proxy würde die
+# Absenderadressen verfälschen, und genau die muss der Hub zurückspiegeln.
+services:
+  holler-hub:
+    build:
+      context: ..
+      dockerfile: hub/Dockerfile
+    container_name: holler-hub
+    restart: unless-stopped
+    network_mode: host
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"

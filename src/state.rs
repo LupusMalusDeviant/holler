@@ -100,6 +100,12 @@ pub struct Peer {
     pub priming: AtomicBool,
     pub skip_samples: AtomicU32,
     pub dropped: AtomicU32,
+    /// Adressen, an denen eine Direktverbindung versucht wird (vom Hub gemeldet).
+    pub candidates: Mutex<Vec<SocketAddr>>,
+    /// Audio läuft über den Hub, weil (noch) kein Direktweg bestätigt ist.
+    pub via_relay: AtomicBool,
+    pub last_ack_ms: AtomicU64,
+    pub last_probe_ms: AtomicU64,
 }
 
 impl Peer {
@@ -128,19 +134,29 @@ impl Peer {
             priming: AtomicBool::new(true),
             skip_samples: AtomicU32::new(0),
             dropped: AtomicU32::new(0),
+            candidates: Mutex::new(Vec::new()),
+            via_relay: AtomicBool::new(false),
+            last_ack_ms: AtomicU64::new(0),
+            last_probe_ms: AtomicU64::new(0),
         }
     }
 
     /// Platz für einen neuen Teilnehmer herrichten. `active` zuletzt, damit der Mixer nichts Halbes sieht.
     #[allow(clippy::too_many_arguments)]
-    pub fn assign(&self, id: u64, name: &str, addr: SocketAddr, path: u8, now_ms: u64, target: u32, volume: f32) {
+    pub fn assign(&self, id: u64, name: &str, addr: Option<SocketAddr>, path: u8, now_ms: u64, target: u32, volume: f32) {
         self.id.store(id, Relaxed);
         if let Ok(mut n) = self.name.lock() {
             *n = name.to_string();
         }
         if let Ok(mut a) = self.addr.lock() {
-            *a = Some(addr);
+            *a = addr;
         }
+        if let Ok(mut c) = self.candidates.lock() {
+            c.clear();
+        }
+        self.via_relay.store(false, Relaxed);
+        self.last_ack_ms.store(0, Relaxed);
+        self.last_probe_ms.store(0, Relaxed);
         self.path.store(path, Relaxed);
         self.codec.store(CODEC_PCM, Relaxed);
         self.volume.store(volume.to_bits(), Relaxed);
@@ -221,6 +237,16 @@ pub struct Shared {
     pub ipv6: AtomicBool,
     /// Feste Gegenstellen, die regelmässig ein HELLO bekommen.
     pub manual_peers: Mutex<Vec<SocketAddr>>,
+    /// Vermittler: aufgelöste Adressen, Zustand, eigene öffentliche Adresse.
+    pub hub_v4: Mutex<Option<SocketAddr>>,
+    pub hub_v6: Mutex<Option<SocketAddr>>,
+    pub hub_name: Mutex<String>,
+    pub hub_error: Mutex<Option<String>>,
+    pub hub_last_ms: AtomicU64,
+    pub hub_rtt_us: AtomicU32,
+    pub public_addr: Mutex<Option<SocketAddr>>,
+    /// Testschalter: Direktwege ignorieren, alles über den Hub.
+    pub force_relay: AtomicBool,
 }
 
 impl Shared {
@@ -265,7 +291,79 @@ impl Shared {
             net_error: Mutex::new(None),
             ipv6: AtomicBool::new(false),
             manual_peers: Mutex::new(Vec::new()),
+            hub_v4: Mutex::new(None),
+            hub_v6: Mutex::new(None),
+            hub_name: Mutex::new(String::new()),
+            hub_error: Mutex::new(None),
+            hub_last_ms: AtomicU64::new(u64::MAX),
+            hub_rtt_us: AtomicU32::new(0),
+            public_addr: Mutex::new(None),
+            force_relay: AtomicBool::new(false),
         }
+    }
+
+    /// Hub-Adresse auflösen (DNS erlaubt) und merken. Leer = kein Hub.
+    pub fn set_hub(&self, spec: &str) {
+        use std::net::ToSocketAddrs;
+        let spec = spec.trim().to_string();
+        let mut v4 = None;
+        let mut v6 = None;
+        let mut err = None;
+        if !spec.is_empty() {
+            let with_port = if spec.rsplit(':').next().is_some_and(|p| p.parse::<u16>().is_ok()) && (spec.matches(':').count() == 1 || spec.contains(']')) {
+                spec.clone()
+            } else {
+                format!("{spec}:4712")
+            };
+            match with_port.to_socket_addrs() {
+                Ok(addrs) => {
+                    for a in addrs {
+                        match a {
+                            SocketAddr::V4(_) if v4.is_none() => v4 = Some(a),
+                            SocketAddr::V6(_) if v6.is_none() => v6 = Some(a),
+                            _ => {}
+                        }
+                    }
+                    if v4.is_none() && v6.is_none() {
+                        err = Some(format!("Hub {spec}: keine Adresse gefunden"));
+                    }
+                }
+                Err(e) => err = Some(format!("Hub {spec}: {e}")),
+            }
+        }
+        if let Ok(mut g) = self.hub_v4.lock() {
+            *g = v4;
+        }
+        if let Ok(mut g) = self.hub_v6.lock() {
+            *g = v6;
+        }
+        if let Ok(mut g) = self.hub_name.lock() {
+            *g = spec;
+        }
+        if let Ok(mut g) = self.hub_error.lock() {
+            *g = err;
+        }
+        self.hub_last_ms.store(u64::MAX, Relaxed);
+    }
+
+    pub fn hub_addrs(&self) -> (Option<SocketAddr>, Option<SocketAddr>) {
+        (self.hub_v4.lock().ok().and_then(|g| *g), self.hub_v6.lock().ok().and_then(|g| *g))
+    }
+
+    pub fn hub_configured(&self) -> bool {
+        let (a, b) = self.hub_addrs();
+        a.is_some() || b.is_some()
+    }
+
+    /// Hub hat in den letzten 15 s geantwortet.
+    pub fn hub_alive(&self) -> bool {
+        let l = self.hub_last_ms.load(Relaxed);
+        l != u64::MAX && self.now_ms().saturating_sub(l) < GONE_MS
+    }
+
+    pub fn is_hub_addr(&self, a: SocketAddr) -> bool {
+        let (v4, v6) = self.hub_addrs();
+        Some(a) == v4 || Some(a) == v6
     }
 
     pub fn now_ms(&self) -> u64 {
@@ -396,8 +494,15 @@ impl Shared {
             ));
         }
         let room = self.room().map(|r| format!("Raum {} ", r.name)).unwrap_or_else(|| "LAN ".into());
+        let hub = if !self.hub_configured() {
+            String::new()
+        } else if self.hub_alive() {
+            format!("hub {:.0}ms{} ", self.hub_rtt_us.load(Relaxed) as f32 / 1000.0, self.public_addr.lock().ok().and_then(|g| *g).map(|a| format!(" pub {a}")).unwrap_or_default())
+        } else {
+            "hub - ".into()
+        };
         format!(
-            "{room}{} Teilnehmer  {}  sw {:.0}ms (+{} Headset)  mic {}  {}",
+            "{room}{hub}{} Teilnehmer  {}  sw {:.0}ms (+{} Headset)  mic {}  {}",
             self.peer_count(),
             if peers.is_empty() { "suche...".to_string() } else { peers.join(" ") },
             self.software_latency_ms(),

@@ -30,6 +30,8 @@ pub struct Config {
     /// Raum und Passwort, vorausgefüllt für den nächsten Klick auf „Beitreten“
     pub room: String,
     pub room_password: String,
+    /// Vermittler „host:port“ für Räume über das Internet; leer = nur LAN
+    pub hub: String,
     #[serde(rename = "in")]
     pub input: Option<String>,
     #[serde(rename = "out")]
@@ -58,6 +60,7 @@ impl Default for Config {
             update_check: true,
             room: String::new(),
             room_password: String::new(),
+            hub: "168.119.111.164:4712".into(),
             input: None,
             output: None,
             peers: Vec::new(),

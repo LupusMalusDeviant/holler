@@ -1,0 +1,12 @@
+[package]
+name = "holler-hub"
+version = "0.1.0"
+edition = "2021"
+authors = ["Lupus Malus Deviant"]
+description = "Vermittler für Holler: Räume, Adress-Reflexion, Relay-Rückfall. Keine Abhängigkeiten."
+
+[[bin]]
+name = "holler-hub"
+path = "src/main.rs"
+
+[dependencies]

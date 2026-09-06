@@ -39,6 +39,12 @@ struct Args {
     /// Raumpasswort
     #[arg(long = "room-password")]
     room_password: Option<String>,
+    /// Vermittler „host:port“ für Räume über das Internet; „off“ = nur LAN
+    #[arg(long)]
+    hub: Option<String>,
+    /// Testschalter: Direktwege ignorieren, alles über den Hub
+    #[arg(long = "force-relay")]
+    force_relay: bool,
     /// Anzeigename bei den anderen
     #[arg(long)]
     name: Option<String>,
@@ -99,6 +105,7 @@ fn main() {
     if let Some(v) = args.port { cfg.port = v; }
     if let Some(v) = &args.room { cfg.room = v.clone(); }
     if let Some(v) = &args.room_password { cfg.room_password = v.clone(); }
+    if let Some(v) = &args.hub { cfg.hub = if v.trim().eq_ignore_ascii_case("off") { String::new() } else { v.clone() }; }
     if let Some(v) = args.name { cfg.name = v; }
     if let Some(v) = args.input { cfg.input = Some(v); }
     if let Some(v) = args.output { cfg.output = Some(v); }
@@ -167,6 +174,12 @@ fn main() {
         cfg.frame_ms,
         if engine.sockets.v6.is_some() { "ja" } else { "nein" }
     );
+
+    shared.set_hub(&cfg.hub);
+    shared.force_relay.store(args.force_relay, std::sync::atomic::Ordering::Relaxed);
+    if let Some(e) = shared.hub_error.lock().ok().and_then(|g| g.clone()) {
+        eprintln!("{e}");
+    }
 
     // Raum von der Kommandozeile: sofort beitreten. Aus der Konfiguration: nur vorausfüllen.
     if args.room.is_some() && !cfg.room.trim().is_empty() {

@@ -44,6 +44,7 @@ pub struct App {
     pw_edit: String,
     peer_edit: String,
     peer_error: Option<String>,
+    hub_edit: String,
     meters: Vec<Meter>,
     updater: Arc<Updater>,
 }
@@ -99,6 +100,7 @@ impl App {
             pw_edit: cfg.room_password.clone(),
             peer_edit: String::new(),
             peer_error: None,
+            hub_edit: cfg.hub.clone(),
             meters: (0..MAX_PEERS + 2).map(|_| Meter::new()).collect(),
             updater,
             shared,
@@ -449,6 +451,28 @@ impl eframe::App for App {
                         "Ohne Raum: offenes LAN wie bisher, unverschlüsselt. Für Verschlüsselung Raum und Passwort setzen.".to_string()
                     };
                     ui.label(RichText::new(status).color(MUTED_TEXT).size(12.0));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Vermittler").color(MUTED_TEXT));
+                        let r = ui.add(egui::TextEdit::singleline(&mut self.hub_edit).desired_width(200.0).hint_text("host:port, leer = nur LAN"));
+                        if r.lost_focus() && self.hub_edit.trim() != self.cfg.hub.trim() {
+                            self.cfg.hub = self.hub_edit.trim().to_string();
+                            self.cfg.save();
+                            s.set_hub(&self.cfg.hub);
+                        }
+                        let hub_text = if let Some(e) = s.hub_error.lock().ok().and_then(|g| g.clone()) {
+                            (RED, e)
+                        } else if !s.hub_configured() {
+                            (MUTED_TEXT, "kein Vermittler, nur LAN".to_string())
+                        } else if room.is_none() {
+                            (MUTED_TEXT, "wird mit dem Raum verbunden".to_string())
+                        } else if s.hub_alive() {
+                            let pub_addr = s.public_addr.lock().ok().and_then(|g| *g).map(|a| format!(" · von aussen {a}")).unwrap_or_default();
+                            (GREEN, format!("verbunden · {:.0} ms{pub_addr}", s.hub_rtt_us.load(Relaxed) as f32 / 1000.0))
+                        } else {
+                            (AMBER, "keine Antwort (UDP 4712 offen? Adresse richtig?)".to_string())
+                        };
+                        ui.label(RichText::new(hub_text.1).color(hub_text.0).size(12.0));
+                    });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("IP manuell").color(MUTED_TEXT));
                         let r = ui.add(egui::TextEdit::singleline(&mut self.peer_edit).desired_width(170.0).hint_text("192.168.1.5 oder [fe80::1]:4711"));

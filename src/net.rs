@@ -1,15 +1,21 @@
-//! Drahtprotokoll v2: UDP, symmetrisch, IPv4 und IPv6, bis 8 Teilnehmer.
+//! Drahtprotokoll v2: UDP, symmetrisch, IPv4 und IPv6, bis 8 Teilnehmer, Hub.
 //!
 //! Kopf (Klartext, 20 Byte): "H2", Typ, Flags, Absender-Kennung u64, Sequenz u32, Zeit µs u32.
 //! Nutzlast: bei Raum verschlüsselt (ChaCha20-Poly1305, Nonce = Kennung+Sequenz, Kopf als AAD).
-//!   HELLO: [version=2][port u16][raum-id 32][name utf8]         Suche per Broadcast, Klartext
-//!   AUDIO: [codec][rahmen ms][pcm i16 * n]                        ein Rahmen pro Paket
-//!   PONG:  leer; das Zeitfeld trägt den Zeitstempel des Fragenden  Laufzeitmessung
-//!   LEAVE: leer
+//!   HELLO   1  [version=2][port u16][raum-id 32][name utf8]        Suche per Broadcast, Klartext
+//!   AUDIO   2  [codec][rahmen ms][pcm i16 * n]                       ein Rahmen pro Paket
+//!   PONG    3  leer; das Zeitfeld trägt den Zeitstempel des Fragenden Laufzeit (Peer oder Hub)
+//!   PROBE   4  [raum-id 32]                                          Direktweg suchen/halten
+//!   PROBE-ACK 5 [raum-id 32]                                         Antwort, bestätigt den Weg
+//!   LEAVE   6  leer
+//!   JOIN   10  an den Hub: [version][raum-id 32][namelen][name][n][fam,ip16,port]*n
+//!   MEMBERS 11 vom Hub: [count]([id][namelen][name][n][kind,fam,ip16,port]*n)*count
+//!   RELAY  12  an den Hub: [ziel-id u64][inneres Paket]
+//!   PING   13  an den Hub, kommt als PONG zurück
 //! Flags: Bit 0 Sender stumm (dann keine Samples), Bit 2 Nutzlast verschlüsselt.
 
 use crate::crypto::ROOM_ID_LEN;
-use crate::state::{classify, Shared, MAX_PEERS, MAX_TARGET, MIN_TARGET, RATE};
+use crate::state::{classify, Shared, MAX_PEERS, MAX_TARGET, MIN_TARGET, PATH_LAN, PATH_RELAY, PATH_V6, RATE};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
@@ -23,10 +29,20 @@ const MAGIC: [u8; 2] = *b"H2";
 const T_HELLO: u8 = 1;
 const T_AUDIO: u8 = 2;
 const T_PONG: u8 = 3;
+const T_PROBE: u8 = 4;
+const T_PROBE_ACK: u8 = 5;
 const T_LEAVE: u8 = 6;
+const T_JOIN: u8 = 10;
+const T_MEMBERS: u8 = 11;
+const T_RELAY: u8 = 12;
+const T_PING: u8 = 13;
 const F_MUTED: u8 = 1;
 const F_ENC: u8 = 4;
 const MAX_GAP_FILL: u32 = 8;
+/// Nach so vielen ms ohne bestätigten Direktweg geht Audio über den Hub.
+const RELAY_AFTER_MS: u64 = 2000;
+/// Direktweg gilt als tot, wenn so lange kein PROBE-ACK kam.
+const DIRECT_DEAD_MS: u64 = 15_000;
 
 #[derive(Clone, Copy)]
 struct Header {
@@ -64,6 +80,43 @@ fn nonce(sender: u64, seq: u32) -> [u8; 12] {
     n[..8].copy_from_slice(&sender.to_le_bytes());
     n[8..].copy_from_slice(&seq.to_le_bytes());
     n
+}
+
+fn push_addr(buf: &mut Vec<u8>, a: SocketAddr) {
+    match a.ip() {
+        IpAddr::V4(ip) => {
+            buf.push(4);
+            buf.extend_from_slice(&ip.to_ipv6_mapped().octets());
+        }
+        IpAddr::V6(ip) => {
+            buf.push(6);
+            buf.extend_from_slice(&ip.octets());
+        }
+    }
+    buf.extend_from_slice(&a.port().to_le_bytes());
+}
+
+fn read_addr(p: &[u8]) -> Option<(SocketAddr, usize)> {
+    if p.len() < 19 {
+        return None;
+    }
+    let mut oct = [0u8; 16];
+    oct.copy_from_slice(&p[1..17]);
+    let port = u16::from_le_bytes([p[17], p[18]]);
+    let ip = match p[0] {
+        4 => IpAddr::V4(Ipv6Addr::from(oct).to_ipv4_mapped().unwrap_or(Ipv4Addr::UNSPECIFIED)),
+        _ => IpAddr::V6(Ipv6Addr::from(oct)),
+    };
+    Some((SocketAddr::new(ip, port), 19))
+}
+
+/// Rang eines Direktwegs: kleiner ist besser.
+fn prio(a: SocketAddr) -> u8 {
+    match classify(a.ip()) {
+        PATH_LAN => 0,
+        PATH_V6 => 1,
+        _ => 2,
+    }
 }
 
 /// Ein IPv4- und ein optionaler IPv6-Socket auf demselben Port.
@@ -107,30 +160,61 @@ impl Sockets {
             }
         }
     }
+
+    /// Eigene Adressen auf dem Weg nach draussen (ohne zu senden): Quelle des Standardwegs.
+    pub fn local_addrs(&self) -> Vec<SocketAddr> {
+        let mut out = Vec::new();
+        if let Ok(s) = UdpSocket::bind("0.0.0.0:0") {
+            if s.connect("8.8.8.8:53").is_ok() {
+                if let Ok(a) = s.local_addr() {
+                    out.push(SocketAddr::new(a.ip(), self.port));
+                }
+            }
+        }
+        if self.v6.is_some() {
+            if let Ok(s) = UdpSocket::bind("[::]:0") {
+                if s.connect("[2001:4860:4860::8888]:53").is_ok() {
+                    if let Ok(a) = s.local_addr() {
+                        if classify(a.ip()) == PATH_V6 {
+                            out.push(SocketAddr::new(a.ip(), self.port));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
-/// Wird im Aufnahme-Callback benutzt: baut ein Audio-Paket und schickt es an alle Teilnehmer.
+/// Wird im Aufnahme-Callback benutzt: baut ein Audio-Paket und schickt es an alle Teilnehmer,
+/// direkt oder als RELAY über den Hub.
 pub struct Wire {
     sockets: Arc<Sockets>,
     shared: Arc<Shared>,
     buf: Vec<u8>,
+    relay: Vec<u8>,
 }
 
 impl Wire {
     pub fn new(sockets: Arc<Sockets>, shared: Arc<Shared>) -> Self {
-        Wire { sockets, shared, buf: Vec::with_capacity(HEADER + 2 + 2 * 1024 + 16) }
+        Wire { sockets, shared, buf: Vec::with_capacity(HEADER + 2 + 2 * 1024 + 16), relay: Vec::with_capacity(HEADER + 8 + 2 * 1024 + 40) }
     }
 
     pub fn send_frame(&mut self, samples: &[i16]) {
         let seq = self.shared.tx_seq.fetch_add(1, Relaxed);
-        let mut targets: [Option<SocketAddr>; MAX_PEERS] = [None; MAX_PEERS];
+        let mut direct: [Option<SocketAddr>; MAX_PEERS] = [None; MAX_PEERS];
+        let mut relayed: [Option<u64>; MAX_PEERS] = [None; MAX_PEERS];
         let mut any = false;
         for (i, p) in self.shared.peers.iter().enumerate() {
-            if p.active.load(Relaxed) {
-                if let Ok(a) = p.addr.try_lock() {
-                    targets[i] = *a;
-                    any |= a.is_some();
-                }
+            if !p.active.load(Relaxed) {
+                continue;
+            }
+            if p.via_relay.load(Relaxed) {
+                relayed[i] = Some(p.id.load(Relaxed));
+                any = true;
+            } else if let Ok(a) = p.addr.try_lock() {
+                direct[i] = *a;
+                any |= a.is_some();
             }
         }
         if !any {
@@ -160,8 +244,18 @@ impl Wire {
             }
         }
         self.buf.extend_from_slice(&payload);
-        for t in targets.iter().flatten() {
+        for t in direct.iter().flatten() {
             self.sockets.send_to(&self.buf, *t);
+        }
+        let (hub4, hub6) = self.shared.hub_addrs();
+        if let Some(hub) = hub4.or(hub6) {
+            for dest in relayed.iter().flatten() {
+                self.relay.clear();
+                write_header(&mut self.relay, &Header { typ: T_RELAY, flags: 0, sender: self.shared.peer_id, seq, ts: h.ts });
+                self.relay.extend_from_slice(&dest.to_le_bytes());
+                self.relay.extend_from_slice(&self.buf);
+                self.sockets.send_to(&self.relay, hub);
+            }
         }
     }
 }
@@ -259,6 +353,8 @@ fn run(socket: Arc<UdpSocket>, sockets: Arc<Sockets>, shared: Arc<Shared>, table
     let mut buf = [0u8; 4096];
     let mut last_hello: u64 = 0;
     let mut last_stats: u64 = 0;
+    let mut last_join: u64 = 0;
+    let mut last_probe: u64 = 0;
     loop {
         match socket.recv_from(&mut buf) {
             Ok((n, src)) => {
@@ -284,6 +380,18 @@ fn run(socket: Arc<UdpSocket>, sockets: Arc<Sockets>, shared: Arc<Shared>, table
         if now.saturating_sub(last_hello) >= interval {
             last_hello = now;
             send_hello(&sockets, &shared, &cfg);
+        }
+        // Hub: JOIN alle 5 s (2 s bis zur ersten Antwort), zusammen mit PING für die Laufzeit.
+        if shared.room().is_some() && shared.hub_configured() {
+            let join_interval = if shared.hub_alive() { 5000 } else { 2000 };
+            if now.saturating_sub(last_join) >= join_interval {
+                last_join = now;
+                send_join(&sockets, &shared);
+            }
+        }
+        if now.saturating_sub(last_probe) >= 500 {
+            last_probe = now;
+            probe_tick(&sockets, &shared, now);
         }
         if now.saturating_sub(last_stats) >= 500 {
             last_stats = now;
@@ -316,10 +424,107 @@ fn send_hello(sockets: &Sockets, shared: &Shared, _cfg: &NetCfg) {
         sockets.send_to(&pkt, a);
     }
     for p in &shared.peers {
-        if p.active.load(Relaxed) {
+        if p.active.load(Relaxed) && !p.via_relay.load(Relaxed) {
             if let Some(a) = p.addr() {
                 sockets.send_to(&pkt, a);
             }
+        }
+    }
+}
+
+fn send_join(sockets: &Sockets, shared: &Shared) {
+    let mut pkt = Vec::with_capacity(HEADER + 40 + 64);
+    write_header(&mut pkt, &Header { typ: T_JOIN, flags: 0, sender: shared.peer_id, seq: 0, ts: shared.now_us() });
+    pkt.push(VERSION);
+    pkt.extend_from_slice(&shared.room_id());
+    let name = shared.name();
+    let name = name.as_bytes();
+    let n = name.len().min(32);
+    pkt.push(n as u8);
+    pkt.extend_from_slice(&name[..n]);
+    let locals = sockets.local_addrs();
+    pkt.push(locals.len() as u8);
+    for a in &locals {
+        push_addr(&mut pkt, *a);
+    }
+    let mut ping = Vec::with_capacity(HEADER);
+    write_header(&mut ping, &Header { typ: T_PING, flags: 0, sender: shared.peer_id, seq: 0, ts: shared.now_us() });
+    let (h4, h6) = shared.hub_addrs();
+    if let Some(a) = h4 {
+        sockets.send_to(&pkt, a);
+        sockets.send_to(&ping, a);
+    }
+    if let Some(a) = h6 {
+        sockets.send_to(&pkt, a);
+        if h4.is_none() {
+            sockets.send_to(&ping, a);
+        }
+    }
+}
+
+fn probe_packet(shared: &Shared, typ: u8) -> Vec<u8> {
+    let mut pkt = Vec::with_capacity(HEADER + ROOM_ID_LEN);
+    write_header(&mut pkt, &Header { typ, flags: 0, sender: shared.peer_id, seq: 0, ts: shared.now_us() });
+    pkt.extend_from_slice(&shared.room_id());
+    pkt
+}
+
+/// Alle 500 ms: Direktwege suchen, halten, aufgeben.
+fn probe_tick(sockets: &Sockets, shared: &Shared, now: u64) {
+    let probe = probe_packet(shared, T_PROBE);
+    let hub_ok = shared.hub_configured() && shared.hub_alive();
+    let force_relay = shared.force_relay.load(Relaxed);
+    for p in &shared.peers {
+        if !p.active.load(Relaxed) {
+            continue;
+        }
+        let candidates: Vec<SocketAddr> = p.candidates.lock().map(|c| c.clone()).unwrap_or_default();
+        if candidates.is_empty() {
+            continue; // reiner LAN-Teilnehmer (per HELLO gefunden), nichts zu tun
+        }
+        let joined = p.joined_ms.load(Relaxed);
+        let last_ack = p.last_ack_ms.load(Relaxed);
+        let has_direct = p.addr().is_some() && !p.via_relay.load(Relaxed);
+        let age = now.saturating_sub(joined);
+        if force_relay {
+            if !p.via_relay.load(Relaxed) && hub_ok {
+                p.via_relay.store(true, Relaxed);
+                p.path.store(PATH_RELAY, Relaxed);
+            }
+            continue;
+        }
+        // Direktweg tot? Zurück auf Relay und neu suchen.
+        if has_direct && last_ack > 0 && now.saturating_sub(last_ack) > DIRECT_DEAD_MS {
+            eprintln!("Direktweg zu {} verloren, Relay", p.name());
+            if let Ok(mut a) = p.addr.lock() {
+                *a = None;
+            }
+            if hub_ok {
+                p.via_relay.store(true, Relaxed);
+                p.path.store(PATH_RELAY, Relaxed);
+            }
+        }
+        // Noch kein Direktweg nach 2 s: Relay, weiter suchen.
+        if !has_direct && !p.via_relay.load(Relaxed) && age > RELAY_AFTER_MS && hub_ok {
+            p.via_relay.store(true, Relaxed);
+            p.path.store(PATH_RELAY, Relaxed);
+        }
+        // Suchen: erste 2 s alle 500 ms an alle Kandidaten, danach alle 5 s; bestehender Weg alle 5 s.
+        let last_probe = p.last_probe_ms.load(Relaxed);
+        let due = if has_direct || age > RELAY_AFTER_MS { now.saturating_sub(last_probe) >= 5000 } else { true };
+        if !due {
+            continue;
+        }
+        p.last_probe_ms.store(now, Relaxed);
+        let current = p.addr();
+        for c in &candidates {
+            // Bestehenden Weg halten; bessere Kandidaten (LAN vor v6 vor v4) weiter versuchen.
+            if let Some(cur) = current {
+                if *c != cur && prio(*c) >= prio(cur) {
+                    continue;
+                }
+            }
+            sockets.send_to(&probe, *c);
         }
     }
 }
@@ -334,20 +539,49 @@ pub fn send_leave(sockets: &Sockets, shared: &Shared) {
             }
         }
     }
+    let (h4, h6) = shared.hub_addrs();
+    for a in [h4, h6].into_iter().flatten() {
+        sockets.send_to(&pkt, a);
+    }
 }
 
 /// Teilnehmer finden oder anlegen. None = Liste voll.
-fn peer_slot(shared: &Shared, table: &mut Table, id: u64, name: &str, addr: SocketAddr, now: u64) -> Option<usize> {
+fn peer_slot(shared: &Shared, table: &mut Table, id: u64, name: &str, addr: Option<SocketAddr>, now: u64) -> Option<usize> {
     if let Some(i) = shared.find_peer(id) {
         return Some(i);
     }
     let i = shared.free_slot()?;
-    let path = classify(addr.ip());
+    let path = addr.map(|a| classify(a.ip())).unwrap_or(crate::state::PATH_UNKNOWN);
     shared.peers[i].assign(id, name, addr, path, now, shared.initial_target(), shared.default_volume_f());
     table.slots[i].rx.reset(shared.frame_samples.load(Relaxed) as usize, now);
     shared.room_full.store(false, Relaxed);
-    eprintln!("Teilnehmer {name} ({addr}) auf Platz {i}, Weg {}", crate::state::path_name(path));
+    eprintln!(
+        "Teilnehmer {name} auf Platz {i}, {}",
+        addr.map(|a| format!("{a}, Weg {}", crate::state::path_name(path))).unwrap_or_else(|| "Adresse über Hub".into())
+    );
     Some(i)
+}
+
+/// Bestätigten Direktweg übernehmen, wenn er besser ist als der aktuelle.
+fn adopt_direct(shared: &Shared, i: usize, src: SocketAddr, now: u64) {
+    let p = &shared.peers[i];
+    let cur = p.addr();
+    let better = match cur {
+        None => true,
+        Some(c) => c == src || prio(src) < prio(c) || p.via_relay.load(Relaxed),
+    };
+    if !better {
+        return;
+    }
+    if cur != Some(src) || p.via_relay.load(Relaxed) {
+        eprintln!("Direktweg zu {}: {src} ({})", p.name(), crate::state::path_name(classify(src.ip())));
+    }
+    if let Ok(mut a) = p.addr.lock() {
+        *a = Some(src);
+    }
+    p.via_relay.store(false, Relaxed);
+    p.path.store(classify(src.ip()), Relaxed);
+    p.last_ack_ms.store(now, Relaxed);
 }
 
 fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table: &mut Table) {
@@ -357,6 +591,7 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
     }
     let body = &pkt[HEADER..];
     let now_ms = shared.now_ms();
+    let from_hub = shared.is_hub_addr(src);
     match h.typ {
         T_HELLO => {
             if body.len() < 3 + ROOM_ID_LEN || body[0] != VERSION {
@@ -370,7 +605,7 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
             }
             let name = String::from_utf8_lossy(&body[3 + ROOM_ID_LEN..]).trim().to_string();
             let addr = SocketAddr::new(src.ip(), port);
-            match peer_slot(shared, table, h.sender, &name, addr, now_ms) {
+            match peer_slot(shared, table, h.sender, &name, Some(addr), now_ms) {
                 Some(i) => {
                     let p = &shared.peers[i];
                     p.last_seen_ms.store(now_ms, Relaxed);
@@ -379,14 +614,98 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
                             *n = name;
                         }
                     }
-                    if p.addr() != Some(addr) {
-                        if let Ok(mut a) = p.addr.lock() {
-                            *a = Some(addr);
-                        }
-                        p.path.store(classify(addr.ip()), Relaxed);
-                    }
+                    // HELLO kommt nur aus dem LAN: bester Weg, sofort nehmen.
+                    adopt_direct(shared, i, addr, now_ms);
                 }
                 None => shared.room_full.store(true, Relaxed),
+            }
+        }
+        T_PROBE | T_PROBE_ACK => {
+            if body.len() < ROOM_ID_LEN || body[..ROOM_ID_LEN] != shared.room_id() {
+                return;
+            }
+            let Some(i) = shared.find_peer(h.sender) else { return };
+            let p = &shared.peers[i];
+            p.last_seen_ms.store(now_ms, Relaxed);
+            if h.typ == T_PROBE {
+                let ack = probe_packet(shared, T_PROBE_ACK);
+                sockets.send_to(&ack, src);
+                // Wenn uns ein Probe erreicht, erreicht unseres wohl auch: gleich mitprobieren.
+                if p.addr().is_none() || p.via_relay.load(Relaxed) {
+                    let probe = probe_packet(shared, T_PROBE);
+                    sockets.send_to(&probe, src);
+                }
+            } else {
+                adopt_direct(shared, i, src, now_ms);
+            }
+        }
+        T_MEMBERS => {
+            if !from_hub || body.is_empty() {
+                return;
+            }
+            shared.hub_last_ms.store(now_ms, Relaxed);
+            let mine = sockets.local_addrs();
+            let count = body[0] as usize;
+            let mut p = 1;
+            for _ in 0..count {
+                if body.len() < p + 8 + 1 {
+                    return;
+                }
+                let id = u64::from_le_bytes(body[p..p + 8].try_into().unwrap_or([0; 8]));
+                p += 8;
+                let nl = body[p] as usize;
+                p += 1;
+                if body.len() < p + nl + 1 {
+                    return;
+                }
+                let name = String::from_utf8_lossy(&body[p..p + nl]).trim().to_string();
+                p += nl;
+                let na = body[p] as usize;
+                p += 1;
+                let mut public = Vec::new();
+                let mut locals = Vec::new();
+                for _ in 0..na {
+                    if body.len() < p + 1 {
+                        return;
+                    }
+                    let kind = body[p];
+                    p += 1;
+                    let Some((a, used)) = read_addr(&body[p..]) else { return };
+                    p += used;
+                    if kind == 1 {
+                        public.push(a);
+                    } else {
+                        locals.push(a);
+                    }
+                }
+                if id == shared.peer_id {
+                    if let Ok(mut g) = shared.public_addr.lock() {
+                        *g = public.first().copied();
+                    }
+                    continue;
+                }
+                let Some(i) = peer_slot(shared, table, id, &name, None, now_ms) else {
+                    shared.room_full.store(true, Relaxed);
+                    continue;
+                };
+                let peer = &shared.peers[i];
+                peer.last_seen_ms.store(now_ms, Relaxed);
+                if let Ok(mut n) = peer.name.lock() {
+                    if !name.is_empty() {
+                        *n = name;
+                    }
+                }
+                if let Ok(mut c) = peer.candidates.lock() {
+                    // Reihenfolge: lokale Adressen zuerst (LAN), dann öffentliche.
+                    let mut list: Vec<SocketAddr> = locals.iter().chain(public.iter()).copied().collect();
+                    list.dedup();
+                    // Eigene Adressen sind keine Kandidaten (Hub im selben Netz meldet uns unsere eigenen).
+                    list.retain(|a| !mine.contains(a));
+                    if list != *c {
+                        *c = list;
+                        peer.last_probe_ms.store(0, Relaxed);
+                    }
+                }
             }
         }
         T_AUDIO => {
@@ -411,7 +730,7 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
             if payload.len() < 2 || payload[0] != crate::state::CODEC_PCM {
                 return;
             }
-            let Some(i) = peer_slot(shared, table, h.sender, "", src, now_ms) else {
+            let Some(i) = peer_slot(shared, table, h.sender, "", if from_hub { None } else { Some(src) }, now_ms) else {
                 shared.room_full.store(true, Relaxed);
                 return;
             };
@@ -421,16 +740,27 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
             p.remote_muted.store(muted, Relaxed);
             p.last_rx_ms.store(now_ms, Relaxed);
             p.last_seen_ms.store(now_ms, Relaxed);
-            if p.addr() != Some(src) {
-                if let Ok(mut a) = p.addr.lock() {
-                    *a = Some(src);
+            if from_hub {
+                if p.addr().is_none() {
+                    p.path.store(PATH_RELAY, Relaxed);
                 }
-                p.path.store(classify(src.ip()), Relaxed);
+            } else if p.addr().is_none() && !p.via_relay.load(Relaxed) {
+                // Direktes Audio ohne vorherigen Handschlag (offenes LAN): Adresse übernehmen.
+                adopt_direct(shared, i, src, now_ms);
             }
             if h.seq % 200 == 0 {
                 let mut pong = Vec::with_capacity(HEADER);
                 write_header(&mut pong, &Header { typ: T_PONG, flags: 0, sender: shared.peer_id, seq: 0, ts: h.ts });
-                sockets.send_to(&pong, src);
+                if from_hub {
+                    // Antwort auf demselben Weg zurück: über den Hub.
+                    let mut wrap = Vec::with_capacity(HEADER + 8 + HEADER);
+                    write_header(&mut wrap, &Header { typ: T_RELAY, flags: 0, sender: shared.peer_id, seq: 0, ts: h.ts });
+                    wrap.extend_from_slice(&h.sender.to_le_bytes());
+                    wrap.extend_from_slice(&pong);
+                    sockets.send_to(&wrap, src);
+                } else {
+                    sockets.send_to(&pong, src);
+                }
             }
 
             let slot = &mut table.slots[i];
@@ -504,9 +834,12 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
             }
         }
         T_PONG => {
-            if let Some(i) = shared.find_peer(h.sender) {
-                let rtt = shared.now_us().wrapping_sub(h.ts);
-                shared.peers[i].rtt_us.store(rtt.min(5_000_000), Relaxed);
+            let rtt = shared.now_us().wrapping_sub(h.ts).min(5_000_000);
+            if from_hub && h.sender == 0 {
+                shared.hub_rtt_us.store(rtt, Relaxed);
+                shared.hub_last_ms.store(now_ms, Relaxed);
+            } else if let Some(i) = shared.find_peer(h.sender) {
+                shared.peers[i].rtt_us.store(rtt, Relaxed);
             }
         }
         T_LEAVE => {
