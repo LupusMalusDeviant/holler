@@ -235,3 +235,11 @@ protokollinkompatibel zu 0.2, also beide Rechner gleichzeitig aktualisieren
    kriechen; jetzt regelt eine Füllstandsregelung pro Teilnehmer (Rahmen
    vorab doppelt einsetzen bzw. verwerfen), Zielpuffer bleibt bei 2–3 Rahmen.
    IPv6-Suche im LAN läuft noch nicht per Multicast, nur über feste Adressen.
+6. **Phase 2 umgesetzt als Version 0.4.0** (6. September 2026): `holler-hub`
+   läuft als Docker-Container im Host-Netz auf dem AppServer (Hetzner,
+   168.119.111.164 / 2a01:4f8:c17:bb4d::1, UDP 4712, UFW offen). Client:
+   JOIN/MEMBERS, Hole-Punching mit PROBE/PROBE-ACK und Vorrang LAN › IPv6 › IPv4,
+   nach 2 s ohne Direktweg Relay über den Hub, Rückfall bei totem Weg, eigene
+   öffentliche Adresse im Fenster. Gemessen von hier: Hub 23 ms Laufzeit, Relay
+   mit 6 ms Jitter und 3–4 Rahmen Puffer. Hub-Domain (z. B.
+   `holler.app.lupusmalus.dev`) noch nicht angelegt, Vorgabe ist die IP.

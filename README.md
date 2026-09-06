@@ -68,7 +68,7 @@ Broadcast von selbst. Findet sich nichts nach ein paar Sekunden:
    Windows Broadcasts. Unter Einstellungen → Netzwerk → das WLAN → auf
    „Privat“ stellen.
 
-## Räume: verschlüsselt und bis zu acht Leute
+## Räume: verschlüsselt, bis zu acht Leute, auch über das Internet
 
 Ohne Raum verhält sich Holler wie ein offenes LAN: jeder im Netz, der Holler
 startet, ist dabei, unverschlüsselt. Für Verschlüsselung tragen alle denselben
@@ -82,6 +82,17 @@ Klick vorausgefüllt, beigetreten wird bewusst per Hand.
 In der Teilnehmerliste hat jede Person eigenen Pegel, Lautstärke 0 bis 300 %
 und einen Schalter „Ton aus“, der nur bei dir wirkt. „Mein Name“ ist frei
 wählbar. Der Mixer summiert alle Stimmen mit weichem Begrenzer.
+
+**Über das Internet** braucht es einen Vermittler (Hub). Holler ist auf den Hub
+`168.119.111.164:4712` voreingestellt; im Fenster unter „Vermittler“ änderbar,
+leer = nur LAN. Sobald ein Raum betreten ist, meldet sich Holler beim Hub, der
+allen im Raum die Adressen der anderen mitteilt. Dann versuchen beide Seiten
+gleichzeitig eine Direktverbindung (Hole-Punching durch den Heimrouter), mit
+Vorrang LAN vor IPv6 vor IPv4. Klappt binnen zwei Sekunden kein Direktweg,
+läuft das Audio verschlüsselt über den Hub weiter, und die Suche geht im
+Hintergrund weiter. Die Teilnehmerliste zeigt pro Person den aktiven Weg:
+„LAN direkt“, „direkt IPv6“, „direkt IPv4“ oder „Relay“. Der Hub sieht nie
+Klartext, er kennt nur Raum-ID und Adressen.
 
 IPv4 und IPv6 laufen gleichzeitig; die Suche per Broadcast ist IPv4, eine
 IPv6-Adresse kann unter „IP manuell“ eingetragen werden (`[fe80::1]:4711`).
@@ -103,12 +114,12 @@ startet das Programm direkt im Tray.
 ## Optionen
 
 ```
-holler [--room <name> --room-password <text>] [--name <text>]
+holler [--room <name> --room-password <text>] [--hub <host:port>|off] [--name <text>]
        [--peer <ip[:port]>]... [--port 4711] [--in <name|index>] [--out <name|index>]
        [--frame 5|10] [--jitter auto|1..8] [--volume 0..300]
        [--mic-gain 0..30] [--gate 0.05..0.95|off] [--denoise on|off]
        [--hotkey F9] [--headset-ms 40] [--config <datei>]
-       [--hidden] [--no-update-check] [--headless] [--list-devices]
+       [--force-relay] [--hidden] [--no-update-check] [--headless] [--list-devices]
 ```
 
 Alles, was im Fenster verändert wird (Geräte, Lautstärke, Puffer, Peer-IP),
@@ -140,6 +151,15 @@ Alles sitzt auf der Senderseite, jeder stellt also sein eigenes Mikrofon ein:
   `--gate 0.3` (empfindlicher) bis `--gate 0.8` (strenger), Vorgabe 0.5.
 - **Lautstärke** unter „Partner hören“ 0 bis 300 % regelt zusätzlich auf der
   Empfängerseite.
+
+## Der Hub (holler-hub)
+
+Ein Rust-Programm ohne Abhängigkeiten in `hub/`, läuft als Docker-Container im
+Host-Netz auf dem Apps-Server (`/opt/holler/hub`, `docker compose up -d --build`).
+Ein UDP-Port 4712, IPv4 und IPv6. Kein Zustand auf Platte, keine Konten. Räume
+verfallen, sobald sie leer sind; Mitglieder ohne Lebenszeichen fliegen nach 15 s.
+Relay ist auf 1,5 MB/s je Mitglied begrenzt. Aktualisieren: auf dem Server
+`git pull` und `docker compose up -d --build`.
 
 ## Signieren, damit Windows nicht warnt
 
@@ -185,7 +205,7 @@ Leute die Exe herunterladen sollen.
 
 ## Grenzen
 
-- Nur im selben Netz. Internet, Hole-Punching und Opus sind in Arbeit, siehe `docs/INTERFACE-v2.md`.
+- Über das Internet noch mit rohem PCM (768 kbit/s je Stimme); Opus kommt in Phase 3, siehe `docs/INTERFACE-v2.md`.
 - Bis acht Teilnehmer. Ohne Raum unverschlüsselt.
 - WASAPI Shared Mode mit 10-ms-Perioden. Kleinere Perioden über
   `IAudioClient3` sind der nächste Schritt, wenn die Messung zeigt, dass es
