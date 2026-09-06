@@ -10,17 +10,31 @@ trotzdem hören wollen.
 Der Entwurf mit Latenzbudget, Fensterbeschreibung und Protokoll steht in
 [docs/INTERFACE.md](docs/INTERFACE.md).
 
-## Download
+## Download und Installation
 
-Fertige Version unter **[Releases](https://github.com/LupusMalusDeviant/holler/releases/latest)**:
-`holler.exe` (signiert), `LupusMalusDeviant.cer` und `vertrauen.cmd`. Die Exe auf
-beide Rechner, fertig. Wer den Hinweis „Unbekannter Herausgeber“ loswerden will,
-legt `.cer` und `vertrauen.cmd` nebeneinander und startet das `.cmd` als
-Administrator. SmartScreen meldet sich bei Downloads einmal: „Weitere
-Informationen“, „Trotzdem ausführen“.
+Fertige Version unter **[Releases](https://github.com/LupusMalusDeviant/holler/releases/latest)**.
 
-Neue Versionen entstehen automatisch: ein Tag `v0.2.0` auf GitHub baut, signiert
-und veröffentlicht (siehe `.github/workflows/release.yml`).
+- **Installer (empfohlen)**: `Holler-Setup-x.y.z.exe`. Installiert pro Benutzer nach
+  `%LOCALAPPDATA%\Programs\Holler`, ohne Adminrechte, mit Startmenü-Eintrag, optional
+  Desktop-Verknüpfung und Autostart im Tray. Deinstallation über Windows-Apps.
+- **Portabel**: `holler.exe` aus dem Zip irgendwohin kopieren und starten.
+
+**Updates**: Holler fragt beim Start die GitHub-Releases ab. Gibt es eine neuere
+Version, erscheint oben im Fenster ein blauer Hinweis. Ein Klick auf „Jetzt
+aktualisieren“ lädt den Installer, prüft seine Prüfsumme gegen die Angabe von
+GitHub, startet ihn still und Holler neu. Die portable Exe bekommt stattdessen
+einen Link zur Download-Seite. Abschalten: `--no-update-check` oder
+`update_check = false` in der Konfiguration. Es zählen nur veröffentlichte
+Releases, nie der Entwicklungsstand auf `main`.
+
+Wer den Hinweis „Unbekannter Herausgeber“ loswerden will, startet im
+Installationsordner `vertrauen.cmd` als Administrator (liegt neben der `.cer`).
+SmartScreen meldet sich bei Downloads einmal: „Weitere Informationen“, „Trotzdem
+ausführen“.
+
+Neue Versionen entstehen automatisch: Version in `Cargo.toml` erhöhen, committen,
+Tag `v0.2.0` pushen. GitHub baut, signiert Exe und Installer und veröffentlicht
+(siehe `.github/workflows/release.yml`).
 
 ## Bauen
 

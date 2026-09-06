@@ -43,6 +43,26 @@ if (-not $NoSign) {
     if ($LASTEXITCODE -ne 0) { throw "Signieren fehlgeschlagen" }
 }
 
+# Installer, falls Inno Setup lokal vorhanden ist (winget install JRSoftware.InnoSetup)
+$iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+if (Test-Path $iscc) {
+    $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+    $isArgs = @("/DAppVersion=$ver", "/DExeDir=$TargetDir\release")
+    if (-not $NoSign) {
+        $wrapper = Join-Path $env:TEMP "holler-sign-one.cmd"
+        "@echo off`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$root\tools\sign.ps1`" -Exe %1" | Out-File -Encoding ascii $wrapper
+        $isArgs += "/DSignSetup"
+        $isArgs += "/Sholler=`"$wrapper`" `$f"
+    }
+    $isArgs += "installer\holler.iss"
+    Write-Host "== Installer bauen (Inno Setup)"
+    & $iscc @isArgs | Select-String -Pattern "Successful|Error|error" | ForEach-Object { Write-Host $_ }
+    if ($LASTEXITCODE -ne 0) { throw "Installer fehlgeschlagen" }
+    Write-Host "== dist\Holler-Setup-$ver.exe"
+} else {
+    Write-Host "== Kein Inno Setup gefunden, Installer entsteht nur auf GitHub (winget install JRSoftware.InnoSetup fuer lokal)."
+}
+
 $sig = Get-AuthenticodeSignature "dist\holler.exe"
 $v = (Get-Item "dist\holler.exe").VersionInfo
 Write-Host ""

@@ -13,6 +13,7 @@ mod net;
 mod state;
 mod tray;
 mod ui;
+mod update;
 
 use clap::Parser;
 use config::Config;
@@ -66,6 +67,9 @@ struct Args {
     /// Versteckt starten, nur Tray-Symbol
     #[arg(long)]
     hidden: bool,
+    /// Keine Update-Prüfung bei GitHub
+    #[arg(long = "no-update-check")]
+    no_update_check: bool,
     /// Kein Fenster, Statuszeile in der Konsole
     #[arg(long)]
     headless: bool,
@@ -96,6 +100,7 @@ fn main() {
     if let Some(v) = args.name { cfg.name = v; }
     if let Some(v) = args.hotkey { cfg.hotkey = v; }
     if let Some(v) = args.headset_ms { cfg.headset_ms = v; }
+    if args.no_update_check { cfg.update_check = false; }
 
     if args.list_devices {
         let host = cpal::default_host();
@@ -151,10 +156,12 @@ fn main() {
         ..Default::default()
     };
     let start_hidden = args.hidden;
+    let updater = update::Updater::new(cfg.update_check);
+    updater.spawn_check();
     if let Err(e) = eframe::run_native(
         "holler",
         options,
-        Box::new(move |cc| Ok(Box::new(ui::App::new(shared, engine, cfg, cc, start_hidden)))),
+        Box::new(move |cc| Ok(Box::new(ui::App::new(shared, engine, cfg, cc, start_hidden, updater)))),
     ) {
         eprintln!("Fenster konnte nicht gestartet werden: {e}");
         std::process::exit(1);

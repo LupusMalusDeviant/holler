@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::engine::Engine;
 use crate::state::{lin_to_db, Shared, MAX_TARGET};
 use crate::tray;
+use crate::update::{self, State as UpState, Updater};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::net::Ipv4Addr;
@@ -42,6 +43,7 @@ pub struct App {
     peer_edit: String,
     peer_error: Option<String>,
     meters: [Meter; 2],
+    updater: Arc<Updater>,
 }
 
 /// Spitzenwert-Haltung für eine Pegelanzeige.
@@ -68,7 +70,7 @@ impl Meter {
 }
 
 impl App {
-    pub fn new(shared: Arc<Shared>, engine: Engine, cfg: Config, cc: &eframe::CreationContext<'_>, start_hidden: bool) -> Self {
+    pub fn new(shared: Arc<Shared>, engine: Engine, cfg: Config, cc: &eframe::CreationContext<'_>, start_hidden: bool, updater: Arc<Updater>) -> Self {
         let hwnd = match cc.window_handle() {
             Ok(h) => match h.as_raw() {
                 RawWindowHandle::Win32(w) => w.hwnd.get() as isize,
@@ -92,6 +94,7 @@ impl App {
             peer_edit: cfg.peer.clone().unwrap_or_default(),
             peer_error: None,
             meters: [Meter::new(), Meter::new()],
+            updater,
             shared,
             engine,
             cfg,
@@ -304,6 +307,47 @@ impl eframe::App for App {
                     });
                 });
                 ui.add_space(6.0);
+                // Update-Hinweis
+                let up = self.updater.state();
+                match &up {
+                    UpState::Available(info) | UpState::Downloading(info, _) => {
+                        let info = info.clone();
+                        egui::Frame::new()
+                            .fill(BLUE.linear_multiply(0.14))
+                            .stroke(Stroke::new(1.0, BLUE.linear_multiply(0.5)))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(Margin::symmetric(12, 8))
+                            .show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    if let UpState::Downloading(_, pct) = up {
+                                        ui.label(RichText::new(format!("Version {} wird geladen … {pct} %", info.version)).color(BLUE).strong());
+                                        ui.add(egui::ProgressBar::new(pct as f32 / 100.0).desired_width(120.0).desired_height(8.0).fill(BLUE));
+                                    } else {
+                                        ui.label(RichText::new(format!("Version {} ist verfügbar (installiert: {})", info.version, update::VERSION)).color(BLUE).strong());
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            if update::is_installed() {
+                                                if ui.button("Jetzt aktualisieren").clicked() {
+                                                    self.cfg.save();
+                                                    self.updater.spawn_install(info.clone());
+                                                }
+                                            } else {
+                                                ui.hyperlink_to("Download-Seite öffnen", &info.page_url);
+                                                ui.label(RichText::new("portable Exe:").color(MUTED_TEXT).size(12.0));
+                                            }
+                                        });
+                                    }
+                                });
+                            });
+                        ui.add_space(4.0);
+                    }
+                    UpState::ReadyToQuit => {
+                        if !tray::quit_requested() {
+                            tray::quit();
+                        }
+                    }
+                    _ => {}
+                }
                 for (color, text) in self.hints() {
                     egui::Frame::new()
                         .fill(color.linear_multiply(0.12))
@@ -468,7 +512,16 @@ impl eframe::App for App {
                 }
                 ui.add_space(6.0);
                 ui.label(RichText::new("× legt das Fenster ins Tray neben der Uhr (evtl. hinter dem Pfeil ^). Beenden über Rechtsklick auf das Tray-Symbol.").color(MUTED_TEXT).size(11.0));
-                ui.label(RichText::new(format!("Holler {} · Lupus Malus Deviant", env!("CARGO_PKG_VERSION"))).color(MUTED_TEXT).size(11.0));
+                let up_text = match self.updater.state() {
+                    UpState::Off => "Update-Prüfung aus".to_string(),
+                    UpState::Checking => "prüfe auf Updates …".to_string(),
+                    UpState::UpToDate => "aktuell".to_string(),
+                    UpState::Available(i) => format!("Version {} verfügbar", i.version),
+                    UpState::Downloading(_, p) => format!("lade Update {p} %"),
+                    UpState::ReadyToQuit => "Installer läuft, Holler startet neu".to_string(),
+                    UpState::Failed(e) => format!("Update-Prüfung: {e}"),
+                };
+                ui.label(RichText::new(format!("Holler {} · Lupus Malus Deviant · {}{}", update::VERSION, up_text, if update::is_installed() { "" } else { " · portabel" })).color(MUTED_TEXT).size(11.0));
                 ui.add_space(6.0);
             });
         });

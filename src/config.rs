@@ -21,6 +21,8 @@ pub struct Config {
     pub gate_vad: f32,
     /// Rauschunterdrückung (RNNoise)
     pub denoise: bool,
+    /// Beim Start auf neue Releases prüfen
+    pub update_check: bool,
     #[serde(rename = "in")]
     pub input: Option<String>,
     #[serde(rename = "out")]
@@ -42,6 +44,7 @@ impl Default for Config {
             gate_on: true,
             gate_vad: 0.5,
             denoise: true,
+            update_check: true,
             input: None,
             output: None,
             peer: None,
