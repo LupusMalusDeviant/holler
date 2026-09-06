@@ -11,7 +11,9 @@ mod config;
 mod crypto;
 mod engine;
 mod icon;
+mod invite;
 mod net;
+mod single;
 mod state;
 mod tray;
 mod ui;
@@ -28,6 +30,15 @@ use std::time::Duration;
 #[derive(Parser, Debug)]
 #[command(name = "holler", version, about = "Holler: LAN-Funk ohne Umwege")]
 struct Args {
+    /// Einladungslink holler://join?room=…&pw=… (kommt vom Link-Handler)
+    #[arg(value_name = "EINLADUNG")]
+    url: Option<String>,
+    /// Stumm starten
+    #[arg(long)]
+    mute: bool,
+    /// Nach n Sekunden beenden (für Tests)
+    #[arg(long = "exit-after", hide = true)]
+    exit_after: Option<u64>,
     /// Feste Gegenstelle „ip“ oder „ip:port“ (mehrfach erlaubt), zusätzlich zur Suche
     #[arg(long)]
     peer: Vec<String>,
@@ -107,6 +118,15 @@ fn main() {
     let mut cfg = Config::load(args.config.clone());
     if !args.peer.is_empty() { cfg.peers = args.peer.clone(); }
     if let Some(v) = args.port { cfg.port = v; }
+    let invite = args.url.as_deref().and_then(invite::Invite::parse);
+    if args.url.is_some() && invite.is_none() {
+        eprintln!("Einladungslink unlesbar: {}", args.url.clone().unwrap_or_default());
+    }
+    if let Some(inv) = &invite {
+        cfg.room = inv.room.clone();
+        cfg.room_password = inv.password.clone();
+        if let Some(h) = &inv.hub { cfg.hub = h.clone(); }
+    }
     if let Some(v) = &args.room { cfg.room = v.clone(); }
     if let Some(v) = &args.room_password { cfg.room_password = v.clone(); }
     if let Some(v) = &args.hub { cfg.hub = if v.trim().eq_ignore_ascii_case("off") { String::new() } else { v.clone() }; }
@@ -141,6 +161,22 @@ fn main() {
             println!("  {i:2}  {n}{def}");
         }
         return;
+    }
+
+    // Nur eine Instanz je Port: die zweite reicht den Link weiter und holt das Fenster nach vorn.
+    if !args.headless && !single::acquire(cfg.port) {
+        if let Some(u) = &args.url {
+            single::hand_over_invite(u);
+        }
+        single::show_existing();
+        eprintln!("Holler läuft bereits, Fenster geholt.");
+        return;
+    }
+    if let Some(secs) = args.exit_after {
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            std::process::exit(0);
+        });
     }
 
     let shared = Arc::new(Shared::new(
@@ -181,6 +217,16 @@ fn main() {
     );
 
     shared.set_hub(&cfg.hub);
+    if args.mute {
+        shared.muted.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Ok(mut m) = shared.volumes.lock() {
+        for (k, v) in &cfg.volumes {
+            if let Ok(id) = u64::from_str_radix(k, 16) {
+                m.insert(id, *v as f32 / 100.0);
+            }
+        }
+    }
     shared.codec_kbps.store(codec::parse_choice(&cfg.codec), std::sync::atomic::Ordering::Relaxed);
     shared.force_relay.store(args.force_relay, std::sync::atomic::Ordering::Relaxed);
     if let Some(e) = shared.hub_error.lock().ok().and_then(|g| g.clone()) {
@@ -188,7 +234,7 @@ fn main() {
     }
 
     // Raum von der Kommandozeile: sofort beitreten. Aus der Konfiguration: nur vorausfüllen.
-    if args.room.is_some() && !cfg.room.trim().is_empty() {
+    if (args.room.is_some() || invite.is_some()) && !cfg.room.trim().is_empty() {
         eprintln!("Berechne Raumschlüssel für „{}“ …", cfg.room.trim());
         shared.set_room(Some(crypto::derive(&cfg.room, &cfg.room_password)));
         eprintln!("Raum „{}“ beigetreten, Pakete verschlüsselt.", cfg.room.trim());

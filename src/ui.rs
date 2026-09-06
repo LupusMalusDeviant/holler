@@ -5,7 +5,9 @@ use crate::codec;
 use crate::config::Config;
 use crate::crypto;
 use crate::engine::Engine;
+use crate::invite::Invite;
 use crate::net;
+use crate::single;
 use crate::state::{lin_to_db, path_name, Shared, CODEC_OPUS, MAX_PEERS, MAX_TARGET};
 use crate::tray;
 use crate::update::{self, State as UpState, Updater};
@@ -47,6 +49,8 @@ pub struct App {
     peer_error: Option<String>,
     hub_edit: String,
     codec_choice: u32,
+    invite_tick: u32,
+    copied_at: Option<Instant>,
     meters: Vec<Meter>,
     updater: Arc<Updater>,
 }
@@ -104,6 +108,8 @@ impl App {
             peer_error: None,
             hub_edit: cfg.hub.clone(),
             codec_choice: codec::parse_choice(&cfg.codec),
+            invite_tick: 0,
+            copied_at: None,
             meters: (0..MAX_PEERS + 2).map(|_| Meter::new()).collect(),
             updater,
             shared,
@@ -278,6 +284,15 @@ impl App {
     }
 
     fn join_room(&mut self) {
+        if let Some(inv) = Invite::parse(&self.room_edit) {
+            self.room_edit = inv.room;
+            self.pw_edit = inv.password;
+            if let Some(h) = inv.hub {
+                self.hub_edit = h.clone();
+                self.cfg.hub = h;
+                self.shared.set_hub(&self.cfg.hub);
+            }
+        }
         let name = self.room_edit.trim().to_string();
         let pw = self.pw_edit.clone();
         self.cfg.room = name.clone();
@@ -320,6 +335,16 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.cfg.save();
             tray::hide_window();
+        }
+
+        self.invite_tick += 1;
+        if self.invite_tick % 45 == 0 {
+            if let Some(url) = single::take_invite() {
+                if Invite::parse(&url).is_some() {
+                    self.room_edit = url;
+                    self.join_room();
+                }
+            }
         }
 
         let s = self.shared.clone();
@@ -431,13 +456,19 @@ impl eframe::App for App {
                     });
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("Raum").color(MUTED_TEXT));
-                        let r1 = ui.add_enabled(room.is_none() && !busy, egui::TextEdit::singleline(&mut self.room_edit).desired_width(150.0).hint_text("z. B. hunt-abend"));
+                        let r1 = ui.add_enabled(room.is_none() && !busy, egui::TextEdit::singleline(&mut self.room_edit).desired_width(150.0).hint_text("Name oder holler://-Link"));
                         ui.label(RichText::new("Passwort").color(MUTED_TEXT));
                         let r2 = ui.add_enabled(room.is_none() && !busy, egui::TextEdit::singleline(&mut self.pw_edit).desired_width(130.0).password(true));
                         let enter = (r1.lost_focus() || r2.lost_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
                         if room.is_some() {
                             if ui.button("Verlassen").clicked() {
                                 do_leave = true;
+                            }
+                            let label = if self.copied_at.is_some_and(|t| t.elapsed().as_secs_f32() < 2.0) { "Kopiert!" } else { "Einladungslink" };
+                            if ui.button(label).on_hover_text("Link in die Zwischenablage: Raum, Passwort und Hub. Der andere fügt ihn im Raumfeld ein oder öffnet ihn.").clicked() {
+                                let inv = Invite { room: self.cfg.room.clone(), password: self.cfg.room_password.clone(), hub: Some(self.cfg.hub.clone()) };
+                                ui.ctx().copy_text(inv.to_url());
+                                self.copied_at = Some(Instant::now());
                             }
                         } else if busy {
                             ui.add_enabled(false, egui::Button::new("Schlüssel …"));
@@ -593,6 +624,11 @@ impl eframe::App for App {
                             ui.spacing_mut().slider_width = 150.0;
                             if ui.add(egui::Slider::new(&mut vol, 0.0..=300.0).suffix(" %").fixed_decimals(0)).changed() {
                                 p.volume.store((vol / 100.0).to_bits(), Relaxed);
+                                let id = p.id.load(Relaxed);
+                                if let Ok(mut m) = s.volumes.lock() {
+                                    m.insert(id, vol / 100.0);
+                                }
+                                self.cfg.volumes.insert(format!("{id:016x}"), vol.round() as u32);
                             }
                             let label = if lm { "Ton an" } else { "Ton aus" };
                             let btn = egui::Button::new(RichText::new(label).size(12.0));

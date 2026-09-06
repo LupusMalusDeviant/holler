@@ -61,6 +61,11 @@ Name: "{group}\Holler deinstallieren"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\Holler"; Filename: "{app}\holler.exe"; Tasks: desktopicon
 
 [Registry]
+; Einladungslinks holler://join?room=…: Windows öffnet Holler mit dem Link als Argument.
+Root: HKCU; Subkey: "Software\Classes\holler"; ValueType: string; ValueName: ""; ValueData: "URL:Holler-Einladung"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\holler"; ValueType: string; ValueName: "URL Protocol"; ValueData: ""
+Root: HKCU; Subkey: "Software\Classes\holler\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\holler.exe,0"
+Root: HKCU; Subkey: "Software\Classes\holler\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\holler.exe"" ""%1"""
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Holler"; ValueData: """{app}\holler.exe"" --hidden"; Tasks: autostart; Flags: uninsdeletevalue
 
 [Run]

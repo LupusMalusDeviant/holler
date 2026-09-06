@@ -251,3 +251,12 @@ protokollinkompatibel zu 0.2, also beide Rechner gleichzeitig aktualisieren
    Sequenzzähler des Empfängers neu. Verlustverschleierung des Dekoders für
    bis zu zwei fehlende Rahmen. Puffer-Überlaufgrenze auf Ziel + 4 Rahmen
    erweitert, weil Jitter-Schübe im Internet sonst Pakete kosteten.
+8. **Phase 4 umgesetzt als Version 1.1.0** (6. September 2026): Einladungslink
+   `holler://join?room=…&pw=…&hub=…` (Knopf kopiert, Raumfeld nimmt Links an,
+   Installer registriert das Schema, laufende Instanz übernimmt Links über
+   eine Übergabedatei), Lautstärken je Teilnehmer-Kennung gemerkt, nur eine
+   Instanz je Port (Mutex, zweiter Start holt das Fenster nach vorn).
+   Wegwechsel direkt ↔ Relay war schon nahtlos (Sequenz läuft weiter).
+   Testhygiene: `--mute --exit-after` für Testinstanzen, nachdem liegen
+   gebliebene Testinstanzen das Mikrofon des Nutzers auf seinen Kopfhörer
+   geschleift hatten.

@@ -617,7 +617,7 @@ fn peer_slot(shared: &Shared, table: &mut Table, id: u64, name: &str, addr: Opti
     }
     let i = shared.free_slot()?;
     let path = addr.map(|a| classify(a.ip())).unwrap_or(crate::state::PATH_UNKNOWN);
-    shared.peers[i].assign(id, name, addr, path, now, shared.initial_target(), shared.default_volume_f());
+    shared.peers[i].assign(id, name, addr, path, now, shared.initial_target(), shared.volume_for(id));
     table.slots[i].rx.reset(shared.frame_samples.load(Relaxed) as usize, now);
     table.slots[i].decoder = None;
     table.slots[i].codec = CODEC_PCM;

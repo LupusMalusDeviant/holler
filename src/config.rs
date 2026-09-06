@@ -2,6 +2,7 @@
 
 use crate::state::JitterMode;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -40,6 +41,8 @@ pub struct Config {
     pub output: Option<String>,
     /// Feste Gegenstellen „ip“ oder „ip:port“, zusätzlich zur Suche
     pub peers: Vec<String>,
+    /// Gemerkte Lautstärken je Teilnehmer-Kennung (hex) in Prozent
+    pub volumes: HashMap<String, u32>,
     #[serde(skip)]
     pub path: Option<PathBuf>,
 }
@@ -67,6 +70,7 @@ impl Default for Config {
             input: None,
             output: None,
             peers: Vec::new(),
+            volumes: HashMap::new(),
             path: None,
         }
     }

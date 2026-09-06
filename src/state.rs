@@ -2,6 +2,7 @@
 //! Acht feste Teilnehmerplätze aus Atomics; die Audio-Threads sperren nie.
 
 use crate::crypto::Room;
+use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, RwLock};
@@ -255,6 +256,8 @@ pub struct Shared {
     pub public_addr: Mutex<Option<SocketAddr>>,
     /// Testschalter: Direktwege ignorieren, alles über den Hub.
     pub force_relay: AtomicBool,
+    /// Gemerkte Lautstärken je Kennung (linear).
+    pub volumes: Mutex<HashMap<u64, f32>>,
 }
 
 impl Shared {
@@ -309,7 +312,13 @@ impl Shared {
             hub_rtt_us: AtomicU32::new(0),
             public_addr: Mutex::new(None),
             force_relay: AtomicBool::new(false),
+            volumes: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Gemerkte oder Standard-Lautstärke für einen Teilnehmer.
+    pub fn volume_for(&self, id: u64) -> f32 {
+        self.volumes.lock().ok().and_then(|m| m.get(&id).copied()).unwrap_or_else(|| self.default_volume_f())
     }
 
     /// Hub-Adresse auflösen (DNS erlaubt) und merken. Leer = kein Hub.

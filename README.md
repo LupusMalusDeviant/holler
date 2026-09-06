@@ -102,6 +102,19 @@ bleibt es immer rohes PCM ohne Codec-Verzögerung. Opus ist reines Rust
 (`opus-pure`), 10-ms-Rahmen, mit Verlustverschleierung bei fehlenden Paketen.
 Die Teilnehmerliste zeigt, was ankommt: „PCM“ oder „Opus 32 kbit/s“.
 
+**Einladungslink.** Im Raum auf „Einladungslink“ klicken: ein `holler://`-Link
+mit Raum, Passwort und Hub landet in der Zwischenablage. Der andere fügt ihn
+ins Raumfeld ein und klickt „Beitreten“, oder öffnet ihn direkt (Installer
+registriert `holler://`, dann reicht ein Klick im Browser oder Win+R). Läuft
+Holler schon, übernimmt die laufende Instanz den Link.
+
+**Lautstärken bleiben.** Was du bei einer Person am Regler einstellst, gilt
+beim nächsten Treffen wieder (gemerkt über ihre Kennung).
+
+**Nur eine Instanz.** Ein zweiter Start holt das Fenster der ersten nach vorn,
+statt still zu scheitern. Für Tests mit zwei Instanzen auf einem Rechner
+verschiedene `--port` nehmen.
+
 IPv4 und IPv6 laufen gleichzeitig; die Suche per Broadcast ist IPv4, eine
 IPv6-Adresse kann unter „IP manuell“ eingetragen werden (`[fe80::1]:4711`).
 
@@ -123,7 +136,7 @@ startet das Programm direkt im Tray.
 
 ```
 holler [--room <name> --room-password <text>] [--hub <host:port>|off] [--codec pcm|opus64|opus32|opus16]
-       [--name <text>]
+       [--name <text>] [--mute]
        [--peer <ip[:port]>]... [--port 4711] [--in <name|index>] [--out <name|index>]
        [--frame 5|10] [--jitter auto|1..8] [--volume 0..300]
        [--mic-gain 0..30] [--gate 0.05..0.95|off] [--denoise on|off]
@@ -141,8 +154,8 @@ Statuszeile in der Konsole. `--config` nimmt eine andere Konfigurationsdatei,
 damit zwei Instanzen auf einem Rechner laufen können, z. B. zum Testen:
 
 ```
-holler --headless --config a.toml --port 4799 --name A --room t --room-password x --peer 127.0.0.1:4798
-holler --headless --config b.toml --port 4798 --name B --room t --room-password x --peer 127.0.0.1:4799
+holler --headless --config a.toml --port 4799 --name A --room t --room-password x --peer 127.0.0.1:4798 --mute --exit-after 20
+holler --headless --config b.toml --port 4798 --name B --room t --room-password x --peer 127.0.0.1:4799 --mute --exit-after 20
 ```
 
 ## Lautstärke, Rauschunterdrückung, Sprechsperre
