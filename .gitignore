@@ -1,0 +1,16 @@
+# Build-Ausgaben
+/target/
+/target-gen3/
+/target-*/
+
+# Fertige Exe und privater Signierschluessel bleiben lokal.
+# Nur der oeffentliche Teil des Zertifikats (.cer) wird veroeffentlicht.
+/dist/*
+!/dist/LupusMalusDeviant.cer
+
+# Editor- und Systemkram
+*.swp
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
