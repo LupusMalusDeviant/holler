@@ -112,6 +112,12 @@ pub struct Capture {
     pub channels: u16,
 }
 
+/// DeepFilterNet hält intern Rc-Zeiger und ist deshalb nicht `Send`. Das Objekt wird auf dem
+/// Hauptthread gebaut, in den Aufnahme-Callback verschoben und nur dort benutzt; es gibt keine
+/// zweite Referenz auf einem anderen Thread. Unter dieser Bedingung ist der Transfer sicher.
+struct SendDf(df::tract::DfTract);
+unsafe impl Send for SendDf {}
+
 pub fn open_capture(dev: &cpal::Device, shared: Arc<Shared>, wire: Wire) -> Result<Capture, String> {
     let sup = dev.default_input_config().map_err(|e| format!("Aufnahmeformat: {e}"))?;
     let rate = sup.sample_rate().0;
@@ -142,6 +148,25 @@ where
 {
     use nnnoiseless::DenoiseState;
     const CHUNK: usize = DenoiseState::FRAME_SIZE; // 480 = 10 ms bei 48 kHz
+    // DeepFilterNet3 (ll): 480er-Hop bei 48 kHz, keine Vorausschau, Eingang in [-1, 1].
+    let mut deep = {
+        let mut rp = df::tract::RuntimeParams::default_with_ch(1);
+        rp.post_filter = true;
+        rp.post_filter_beta = 0.02;
+        match df::tract::DfTract::new(df::tract::DfParams::default(), &rp) {
+            Ok(d) if d.hop_size == CHUNK && d.sr == RATE as usize => Some(SendDf(d)),
+            Ok(d) => {
+                eprintln!("DeepFilterNet passt nicht (hop {} sr {}), Rückfall auf RNNoise", d.hop_size, d.sr);
+                None
+            }
+            Err(e) => {
+                eprintln!("DeepFilterNet nicht ladbar ({e}), Rückfall auf RNNoise");
+                None
+            }
+        }
+    };
+    let mut df_in = ndarray::Array2::<f32>::zeros((1, CHUNK));
+    let mut df_out = ndarray::Array2::<f32>::zeros((1, CHUNK));
     let ch = channels.max(1) as usize;
     let mut rs = PushResampler::new(rate, RATE);
     let mut mono: Vec<f32> = Vec::with_capacity(8192);
@@ -187,13 +212,25 @@ where
                     }
                     den_in[i] = g.clamp(-1.0, 1.0) * 32767.0;
                 }
-                // RNNoise: entrauscht und schätzt, ob gesprochen wird
-                let vad = if denoise || threshold > 0.0 {
-                    denoiser.process_frame(&mut den_out, &den_in)
-                } else {
-                    1.0
-                };
-                let src: &[f32] = if denoise { &den_out } else { &den_in };
+                // Sprechsperre: RNNoise schätzt, ob gesprochen wird (und entrauscht als Rückfall).
+                let need_rnn = threshold > 0.0 || (denoise && deep.is_none());
+                let vad = if need_rnn { denoiser.process_frame(&mut den_out, &den_in) } else { 1.0 };
+                // Rauschunterdrückung: DeepFilterNet auf dem verstärkten Signal.
+                let mut deep_ok = false;
+                if denoise {
+                    if let Some(SendDf(d)) = deep.as_mut() {
+                        for (i, v) in den_in.iter().enumerate() {
+                            df_in[[0, i]] = v / 32767.0;
+                        }
+                        if d.process(df_in.view(), df_out.view_mut()).is_ok() {
+                            for i in 0..CHUNK {
+                                den_out[i] = df_out[[0, i]].clamp(-1.0, 1.0) * 32767.0;
+                            }
+                            deep_ok = true;
+                        }
+                    }
+                }
+                let src: &[f32] = if denoise && (deep_ok || need_rnn) { &den_out } else { &den_in };
                 let mut sum_sq = 0.0f32;
                 for &v in src {
                     let f = v / 32767.0;
@@ -349,3 +386,84 @@ where
     .map_err(|e| format!("Wiedergabe öffnen: {e}"))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use nnnoiseless::DenoiseState;
+
+    fn rms(v: &[f32]) -> f64 {
+        (v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>() / v.len() as f64).sqrt()
+    }
+
+    /// Weisses Rauschen muss der Filter deutlich daempfen; sonst ist er eine Durchleitung.
+    fn attenuation_db(scale: f32) -> f64 {
+        attenuation_db_passes(scale, 1)
+    }
+
+    fn attenuation_db_passes(scale: f32, passes: usize) -> f64 {
+        let mut states: Vec<_> = (0..passes).map(|_| DenoiseState::new()).collect();
+        let st = &mut states;
+        let n = DenoiseState::FRAME_SIZE;
+        let mut seed: u32 = 12345;
+        let mut out = vec![0.0f32; n];
+        let mut din = 0.0;
+        let mut dout = 0.0;
+        for f in 0..100 {
+            let input: Vec<f32> = (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    ((seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * 0.05 * scale
+                })
+                .collect();
+            let mut cur = input.clone();
+            for st in st.iter_mut() {
+                let _vad = st.process_frame(&mut out, &cur);
+                cur = out.clone();
+            }
+            if f >= 20 {
+                din += rms(&input);
+                dout += rms(&out);
+            }
+        }
+        20.0 * (din / dout.max(1e-9)).log10()
+    }
+
+    /// DeepFilterNet muss weisses Rauschen um deutlich mehr als RNNoise daempfen.
+    #[test]
+    fn deepfilternet_daempft_rauschen() {
+        let mut rp = df::tract::RuntimeParams::default_with_ch(1);
+        rp.post_filter = true;
+        let mut d = df::tract::DfTract::new(df::tract::DfParams::default(), &rp).expect("DeepFilterNet");
+        assert_eq!(d.hop_size, 480);
+        assert_eq!(d.lookahead, 0, "Low-Latency-Modell erwartet");
+        let mut input = ndarray::Array2::<f32>::zeros((1, 480));
+        let mut out = ndarray::Array2::<f32>::zeros((1, 480));
+        let mut seed: u32 = 99;
+        let mut din = 0.0f64;
+        let mut dout = 0.0f64;
+        for f in 0..100 {
+            for i in 0..480 {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                input[[0, i]] = ((seed >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * 0.05;
+            }
+            d.process(input.view(), out.view_mut()).expect("process");
+            if f >= 20 {
+                din += rms(input.as_slice().unwrap());
+                dout += rms(out.as_slice().unwrap());
+            }
+        }
+        let db = 20.0 * (din / dout.max(1e-12)).log10();
+        eprintln!("DeepFilterNet: weisses Rauschen {db:.1} dB gedaempft");
+        assert!(db > 20.0, "zu wenig Daempfung: {db:.1} dB");
+    }
+
+    #[test]
+    fn rnnoise_daempft_rauschen() {
+        let db_i16 = attenuation_db(32767.0);
+        let db_unit = attenuation_db(1.0);
+        let db_2 = attenuation_db_passes(32767.0, 2);
+        let db_3 = attenuation_db_passes(32767.0, 3);
+        eprintln!("Daempfung weisses Rauschen: i16-Skala {db_i16:.1} dB, Einheitsskala {db_unit:.1} dB, 2 Stufen {db_2:.1} dB, 3 Stufen {db_3:.1} dB");
+        assert!(db_i16 > 3.0, "Filter daempft nicht: i16 {db_i16:.1} dB, unit {db_unit:.1} dB");
+    }
+}

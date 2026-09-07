@@ -261,3 +261,12 @@ protokollinkompatibel zu 0.2, also beide Rechner gleichzeitig aktualisieren
    Testhygiene: `--mute --exit-after` für Testinstanzen, nachdem liegen
    gebliebene Testinstanzen das Mikrofon des Nutzers auf seinen Kopfhörer
    geschleift hatten.
+9. **Version 1.3.0** (7. September 2026): Rauschunterdrückung von RNNoise auf
+   DeepFilterNet3 (ll, tract, `deep_filter` v0.5.6 per Git-Tag, kstring auf
+   2.0.2 gepinnt wegen rustc-Anforderung) umgestellt, nachdem der Nutzer Kauen,
+   Tippen und Klappern hörte und der Haken „nichts änderte“. Messung mit
+   TTS-Sprache plus Rauschen/Klicks/Kaubursts: Restrauschen in Pausen −77 dBFS
+   (DF) gegen −56 dBFS (RNNoise) bei −40 dBFS Eingang, Sprache −0,6 dB, 0,4 ms je
+   Rahmen, Vorausschau 0. RNNoise bleibt Sprachdetektor für die Sperre und
+   Rückfall. Exe 10 → 62 MB. Version 1.2.0 (6.9.): Linux/macOS-Builds, cargo test
+   in CI, Hub-Healthcheck, Whiskers-Alarmregel.

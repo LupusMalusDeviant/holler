@@ -176,10 +176,14 @@ Alles sitzt auf der Senderseite, jeder stellt also sein eigenes Mikrofon ein:
 
 - **Verstärkung** 0 bis 30 dB (Vorgabe 12 dB). Hochdrehen, bis der Pegel
   beim Sprechen um -20 dB liegt und der Balken nicht rot wird.
-- **Rauschunterdrückung** (Vorgabe an) ist RNNoise, ein kleines neuronales
-  Netz, das Grundrauschen, Lüfter und Tastatur aus der Stimme rechnet. Es
-  kostet etwa 10 ms Verzögerung und wenig CPU. Bei Bedarf abschaltbar.
-- **Sprechsperre** (Vorgabe an) sendet nur, wenn RNNoise Sprache erkennt.
+- **Rauschunterdrückung** (Vorgabe an) ist seit 1.3.0 DeepFilterNet3 in der
+  Low-Latency-Variante (reines Rust, Modell eingebettet, MIT/Apache). Sie rechnet
+  Grundrauschen, Lüfter, Tastatur und Kauen aus der Stimme, ohne Vorausschau,
+  rund 0,4 ms Rechenzeit je 10 ms. Gemessen an Sprache mit Störungen: Restrauschen
+  in Pausen 37 dB leiser, RNNoise schaffte 17 dB. Der Preis ist eine grössere Exe
+  (rund 60 MB, im Installer gepackt deutlich weniger). Bei Bedarf abschaltbar;
+  fällt das Modell aus, springt RNNoise ein.
+- **Sprechsperre** (Vorgabe an) sendet nur, wenn RNNoise Sprache erkennt (RNNoise bleibt dafür als Sprachdetektor im Einsatz).
   Öffnet sofort, hält 400 ms, blendet weich aus. Kein Schwellwert nötig; die
   Zeile unter dem Pegel zeigt, ob gerade gesendet wird. Feinjustage per
   `--gate 0.3` (empfindlicher) bis `--gate 0.8` (strenger), Vorgabe 0.5.

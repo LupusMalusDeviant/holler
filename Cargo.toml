@@ -1,6 +1,6 @@
 [package]
 name = "holler"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2021"
 authors = ["Lupus Malus Deviant"]
 description = "Holler: LAN-Funk ohne Umwege. Rohes PCM per UDP, ein Fenster, eine Exe."
@@ -14,6 +14,9 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 global-hotkey = "0.6"
 nnnoiseless = { version = "0.5", default-features = false }
+# DeepFilterNet3 (Low-Latency-Modell) als Rauschunterdrueckung, reines Rust ueber tract.
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", tag = "v0.5.6", default-features = false, features = ["tract", "default-model-ll"] }
+ndarray = "0.15"
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -38,3 +41,4 @@ members = ["hub"]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
+strip = true
