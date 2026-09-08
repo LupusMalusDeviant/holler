@@ -3,12 +3,13 @@
 
 use crate::codec;
 use crate::config::Config;
+use crate::desktop;
 use crate::crypto;
 use crate::engine::Engine;
 use crate::invite::Invite;
 use crate::net;
 use crate::single;
-use crate::state::{lin_to_db, path_name, Shared, CODEC_OPUS, MAX_PEERS, MAX_TARGET};
+use crate::state::{lin_to_db, path_name, Shared, CODEC_OPUS, KIND_VOICE, MAX_TARGET, SLOTS};
 use crate::tray;
 use crate::update::{self, State as UpState, Updater};
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
@@ -48,6 +49,12 @@ pub struct App {
     peer_error: Option<String>,
     hub_edit: String,
     codec_choice: u32,
+    desktop_on: bool,
+    desktop_music: bool,
+    desktop_gain: f32,
+    desktop_source: String,
+    procs: Vec<(u32, String)>,
+    procs_at: Option<Instant>,
     invite_tick: u32,
     copied_at: Option<Instant>,
     meters: Vec<Meter>,
@@ -77,8 +84,9 @@ impl Meter {
     }
 }
 
-const METER_MIC: usize = MAX_PEERS;
-const METER_MIX: usize = MAX_PEERS + 1;
+const METER_MIC: usize = SLOTS;
+const METER_MIX: usize = SLOTS + 1;
+const METER_DESK: usize = SLOTS + 2;
 
 impl App {
     pub fn new(shared: Arc<Shared>, engine: Engine, cfg: Config, cc: &eframe::CreationContext<'_>, start_hidden: bool, updater: Arc<Updater>) -> Self {
@@ -113,9 +121,15 @@ impl App {
             peer_error: None,
             hub_edit: cfg.hub.clone(),
             codec_choice: codec::parse_choice(&cfg.codec),
+            desktop_on: cfg.desktop_on,
+            desktop_music: cfg.desktop_quality.trim().eq_ignore_ascii_case("musik"),
+            desktop_gain: cfg.desktop_gain.min(300) as f32,
+            desktop_source: cfg.desktop_source.clone(),
+            procs: Vec::new(),
+            procs_at: None,
             invite_tick: 0,
             copied_at: None,
-            meters: (0..MAX_PEERS + 2).map(|_| Meter::new()).collect(),
+            meters: (0..SLOTS + 3).map(|_| Meter::new()).collect(),
             updater,
             shared,
             engine,
@@ -176,6 +190,9 @@ impl App {
         }
         for e in [&self.hotkey_error, &self.tray_error, &self.peer_error].into_iter().flatten() {
             v.push((AMBER, e.clone()));
+        }
+        if let Some(e) = s.desktop_error.lock().ok().and_then(|g| g.clone()) {
+            v.push((AMBER, format!("Desktop-Audio: {e}")));
         }
         if s.room_full.load(Relaxed) {
             v.push((AMBER, "Raum voll: mehr als 8 Teilnehmer, jemand wurde abgewiesen.".into()));
@@ -597,7 +614,7 @@ impl eframe::App for App {
                 let mut meters = std::mem::take(&mut self.meters);
                 Self::card(ui, &format!("Teilnehmer · {count}"), |ui| {
                     let mut any = false;
-                    let mut order: Vec<usize> = (0..MAX_PEERS).filter(|&i| s.peers[i].active.load(Relaxed)).collect();
+                    let mut order: Vec<usize> = (0..SLOTS).filter(|&i| s.peers[i].active.load(Relaxed) && s.peers[i].kind.load(Relaxed) == KIND_VOICE).collect();
                     order.sort_by_key(|&i| (s.peers[i].path.load(Relaxed), s.peers[i].joined_ms.load(Relaxed)));
                     for i in order {
                         let p = &s.peers[i];
@@ -642,6 +659,33 @@ impl eframe::App for App {
                                 p.local_mute.store(!lm, Relaxed);
                             }
                         });
+                        // Desktop-Kanal dieser Person
+                        if let Some(d) = s.find_desktop(p.id.load(Relaxed)) {
+                            let dp = &s.peers[d];
+                            let dstreaming = dp.streaming(now);
+                            ui.horizontal(|ui| {
+                                ui.add_space(22.0);
+                                ui.label(RichText::new("Desktop").color(BLUE).size(12.0).strong());
+                                let codec_text = if dp.codec.load(Relaxed) == CODEC_OPUS { format!("Opus {} kbit/s", dp.codec_kbps.load(Relaxed)) } else { "PCM".to_string() };
+                                ui.label(RichText::new(format!("{} · {} · Puffer {}/{:.0} ms", if dp.channels.load(Relaxed) == 2 { "stereo" } else { "mono" }, codec_text, dp.target_frames.load(Relaxed), dp.buffered_samples.load(Relaxed) as f32 / 48.0)).color(MUTED_TEXT).size(11.5));
+                            });
+                            ui.horizontal(|ui| {
+                                ui.add_space(22.0);
+                                let lm = dp.local_mute.load(Relaxed);
+                                Self::meter(ui, &mut meters[d], dp.level_f(), false, lm || !dstreaming, 150.0);
+                                let mut vol = dp.volume_f() * 100.0;
+                                ui.spacing_mut().slider_width = 150.0;
+                                if ui.add(egui::Slider::new(&mut vol, 0.0..=300.0).suffix(" %").fixed_decimals(0)).changed() {
+                                    dp.volume.store((vol / 100.0).to_bits(), Relaxed);
+                                }
+                                let label = if lm { "Ton an" } else { "Ton aus" };
+                                let btn = egui::Button::new(RichText::new(label).size(12.0));
+                                let btn = if lm { btn.fill(RED.linear_multiply(0.3)) } else { btn };
+                                if ui.add(btn).on_hover_text("Desktop-Audio dieser Person nur bei mir aus").clicked() {
+                                    dp.local_mute.store(!lm, Relaxed);
+                                }
+                            });
+                        }
                         ui.add_space(4.0);
                     }
                     if !any {
@@ -700,6 +744,90 @@ impl eframe::App for App {
                     });
                     ui.label(RichText::new("Rauschunterdrückung nimmt Grundrauschen, Lüfter und Tastatur aus der Stimme. Die Sprechsperre sendet nur, wenn gesprochen wird.").color(MUTED_TEXT).size(11.0));
                 });
+
+                // ---------------- Desktop-Audio ----------------
+                let mut desktop_restart = false;
+                Self::card(ui, "Desktop-Audio", |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut self.desktop_on, "Desktop-Audio senden").changed() {
+                            desktop_restart = true;
+                        }
+                        let running = self.engine.desktop_running();
+                        let (c, t) = if running { (GREEN, "läuft") } else if self.desktop_on { (AMBER, "startet nicht") } else { (MUTED_TEXT, "aus") };
+                        ui.label(RichText::new(t).color(c).size(12.0));
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Quelle").color(MUTED_TEXT));
+                        // Programmliste (Windows) alle 3 s auffrischen, solange die Karte sichtbar ist.
+                        if cfg!(windows) && self.procs_at.is_none_or(|t| t.elapsed().as_secs_f32() > 3.0) {
+                            self.procs = desktop::list_processes();
+                            self.procs_at = Some(Instant::now());
+                        }
+                        let current = desktop::Source::parse(&self.desktop_source);
+                        let mut sel = self.desktop_source.clone();
+                        egui::ComboBox::from_id_salt("desk-src").width(320.0).selected_text(current.label()).show_ui(ui, |ui| {
+                            if cfg!(windows) {
+                                ui.selectable_value(&mut sel, "all".to_string(), "Alles ausser Holler");
+                                for (pid, name) in &self.procs {
+                                    ui.selectable_value(&mut sel, format!("pid:{pid}:{name}"), format!("Nur {name}"));
+                                }
+                            }
+                            for (n, _) in &self.engine.devices.inputs {
+                                ui.selectable_value(&mut sel, format!("dev:{n}"), format!("Gerät: {n}"));
+                            }
+                        });
+                        if sel != self.desktop_source {
+                            self.desktop_source = sel.clone();
+                            self.cfg.desktop_source = sel.clone();
+                            if let Ok(mut g) = s.desktop_source.lock() {
+                                *g = sel;
+                            }
+                            self.cfg.save();
+                            if self.desktop_on {
+                                desktop_restart = true;
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Qualität").color(MUTED_TEXT));
+                        let before = self.desktop_music;
+                        egui::ComboBox::from_id_salt("desk-q")
+                            .width(180.0)
+                            .selected_text(if self.desktop_music { "Musik · Opus 160" } else { "Spiel · Opus 96" })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut self.desktop_music, false, "Spiel · Opus 96");
+                                ui.selectable_value(&mut self.desktop_music, true, "Musik · Opus 160");
+                            });
+                        if before != self.desktop_music {
+                            s.desktop_music.store(self.desktop_music, Relaxed);
+                            s.desktop_kbps.store(if self.desktop_music { 160 } else { 96 }, Relaxed);
+                            self.cfg.desktop_quality = if self.desktop_music { "musik".into() } else { "spiel".into() };
+                            self.cfg.save();
+                        }
+                        let expl = if self.desktop_music { "Stereo, 160 kbit/s, Musikprofil. Für gemeinsames Musikhören." } else { "Stereo, 96 kbit/s. Spielsound, sprachtauglich. Im LAN immer rohes PCM." };
+                        ui.label(RichText::new(expl).color(MUTED_TEXT).size(11.5));
+                    });
+                    let w = ui.available_width();
+                    Self::meter(ui, &mut meters[METER_DESK], s.desktop_level_f(), false, !self.engine.desktop_running(), w);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Sendepegel").color(MUTED_TEXT));
+                        if ui.add(egui::Slider::new(&mut self.desktop_gain, 0.0..=300.0).suffix(" %").fixed_decimals(0)).changed() {
+                            s.desktop_gain.store((self.desktop_gain / 100.0).to_bits(), Relaxed);
+                            self.cfg.desktop_gain = self.desktop_gain.round() as u32;
+                        }
+                    });
+                    let hint = if cfg!(windows) {
+                        "„Alles ausser Holler“ nimmt jedes Programm auf, auch Discord. Läuft Discord parallel, besser „Nur <Spiel>“. Stumm (F9) betrifft nur die Stimme."
+                    } else {
+                        "Quelle ist ein Aufnahmegerät: unter Linux ein „Monitor of …“, unter macOS ein virtuelles Gerät wie BlackHole. Holler selbst auf ein anderes Ausgabegerät legen, sonst hört das Gegenüber sich selbst."
+                    };
+                    ui.label(RichText::new(hint).color(MUTED_TEXT).size(11.0));
+                });
+                if desktop_restart {
+                    self.cfg.desktop_on = self.desktop_on;
+                    self.cfg.save();
+                    self.engine.set_desktop(self.desktop_on);
+                }
 
                 // ---------------- Ausgabe ----------------
                 Self::card(ui, "Ausgabe", |ui| {

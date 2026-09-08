@@ -35,6 +35,11 @@ pub struct Config {
     pub hub: String,
     /// Qualität für Ferne: pcm, opus64, opus32, opus16
     pub codec: String,
+    /// Desktop-Audio senden (Opt-in), Quelle (all | pid:… | dev:…), Qualität (spiel | musik), Sendepegel in Prozent
+    pub desktop_on: bool,
+    pub desktop_source: String,
+    pub desktop_quality: String,
+    pub desktop_gain: u32,
     #[serde(rename = "in")]
     pub input: Option<String>,
     #[serde(rename = "out")]
@@ -67,6 +72,10 @@ impl Default for Config {
             room_password: String::new(),
             hub: DEFAULT_HUB.into(),
             codec: "opus32".into(),
+            desktop_on: false,
+            desktop_source: if cfg!(windows) { "all".into() } else { String::new() },
+            desktop_quality: "spiel".into(),
+            desktop_gain: 100,
             input: None,
             output: None,
             peers: Vec::new(),
@@ -128,6 +137,9 @@ impl Config {
         cfg.path = path;
         if cfg.hub.trim() == OLD_HUB_IP {
             cfg.hub = DEFAULT_HUB.into();
+        }
+        if cfg.hub.trim().eq_ignore_ascii_case("off") {
+            cfg.hub = String::new();
         }
         if cfg.peer_id == 0 {
             cfg.peer_id = rand::random::<u64>().max(1);

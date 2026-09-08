@@ -153,6 +153,7 @@ holler [--room <name> --room-password <text>] [--hub <host:port>|off] [--codec p
        [--frame 5|10] [--jitter auto|1..8] [--volume 0..300]
        [--mic-gain 0..30] [--gate 0.05..0.95|off] [--denoise on|off]
        [--hotkey F9] [--headset-ms 40] [--config <datei>]
+       [--desktop on|off] [--desktop-source all|pid:<nr>|dev:<name>] [--list-desktop-sources]
        [--force-relay] [--hidden] [--no-update-check] [--headless] [--list-devices]
 ```
 
@@ -189,6 +190,27 @@ Alles sitzt auf der Senderseite, jeder stellt also sein eigenes Mikrofon ein:
   `--gate 0.3` (empfindlicher) bis `--gate 0.8` (strenger), Vorgabe 0.5.
 - **Lautstärke** unter „Partner hören“ 0 bis 300 % regelt zusätzlich auf der
   Empfängerseite.
+
+## Desktop-Audio: Spielsound oder Musik mitsenden
+
+Opt-in je Sender, eigener Kanal je Person, stereo. Im Kasten „Desktop-Audio“:
+
+- **Desktop-Audio senden** einschalten. Der Kanal läuft unabhängig von der
+  Stimme: keine Rauschunterdrückung, keine Sprechsperre, F9 betrifft ihn nicht.
+- **Quelle.** Windows: „Alles ausser Holler“ (Prozess-Loopback, Hollers eigene
+  Ausgabe ist nie enthalten, also kein Echo) oder „Nur <Programm>“ aus der Liste
+  der Programme mit Tonausgabe. Läuft Discord parallel, besser „Nur <Spiel>“,
+  sonst hören die anderen den Discord-Ton doppelt. Linux und macOS: ein
+  Aufnahmegerät, unter Linux ein „Monitor of …“, unter macOS ein virtuelles
+  Gerät wie BlackHole mit Multi-Output; Holler dort auf ein anderes Ausgabegerät
+  legen, sonst hört das Gegenüber sich selbst.
+- **Qualität.** Spiel: Stereo, Opus 96 kbit/s. Musik: Opus 160 kbit/s im
+  Musikprofil. Im LAN immer rohes PCM stereo (1,5 Mbit/s je Empfänger).
+- **Sendepegel** 0 bis 300 %.
+
+Bei den Empfängern erscheint unter der Person eine zweite Zeile „Desktop“ mit
+Pegel, eigenem Regler und „Ton aus“. `--list-desktop-sources` zeigt die Quellen,
+`--desktop on --desktop-source pid:1234` schaltet per Kommandozeile.
 
 ## Der Hub (holler-hub)
 

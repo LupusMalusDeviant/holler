@@ -16,7 +16,7 @@
 
 use crate::codec;
 use crate::crypto::ROOM_ID_LEN;
-use crate::state::{classify, Shared, CODEC_OPUS, CODEC_PCM, MAX_PEERS, MAX_TARGET, MIN_TARGET, PATH_LAN, PATH_RELAY, PATH_V6, RATE};
+use crate::state::{classify, Shared, CODEC_OPUS, CODEC_PCM, DESKTOP_GONE_MS, KIND_DESKTOP, KIND_VOICE, MAX_PEERS, MAX_TARGET, MIN_TARGET, PATH_LAN, PATH_RELAY, PATH_V6, RATE};
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
@@ -39,13 +39,17 @@ const T_RELAY: u8 = 12;
 const T_PING: u8 = 13;
 const F_MUTED: u8 = 1;
 const F_ENC: u8 = 4;
+/// Zweiter Kanal: Desktop-Audio des Senders (stereo).
+const F_DESKTOP: u8 = 8;
 const MAX_GAP_FILL: u32 = 8;
 /// Nach so vielen ms ohne bestätigten Direktweg geht Audio über den Hub.
 const RELAY_AFTER_MS: u64 = 2000;
 /// Direktweg gilt als tot, wenn so lange kein PROBE-ACK kam.
 const DIRECT_DEAD_MS: u64 = 15_000;
-/// Opus-Pakete nutzen den oberen Sequenzraum, damit die Nonce je Schlüssel eindeutig bleibt.
+/// Sequenzräume, damit die Nonce je Schlüssel eindeutig bleibt: Bit 31 Opus, Bit 30 Desktop.
 const SEQ_OPUS: u32 = 0x8000_0000;
+const SEQ_DESK: u32 = 0x4000_0000;
+const SEQ_MASK: u32 = 0x3FFF_FFFF;
 
 #[derive(Clone, Copy)]
 struct Header {
@@ -197,6 +201,8 @@ pub struct Wire {
     buf: Vec<u8>,
     relay: Vec<u8>,
     encoder: Option<codec::Encoder>,
+    enc_kbps: u32,
+    enc_music: bool,
     opus_acc: Vec<i16>,
     opus_pkt: Vec<u8>,
 }
@@ -206,19 +212,26 @@ impl Wire {
         Wire {
             sockets,
             shared,
-            buf: Vec::with_capacity(HEADER + 2 + 2 * 1024 + 16),
-            relay: Vec::with_capacity(HEADER + 8 + 2 * 1024 + 40),
+            buf: Vec::with_capacity(HEADER + 4 + 4 * 1024 + 16),
+            relay: Vec::with_capacity(HEADER + 8 + 4 * 1024 + 40),
             encoder: None,
+            enc_kbps: 0,
+            enc_music: false,
             opus_acc: Vec::with_capacity(codec::FRAME * 2),
             opus_pkt: Vec::with_capacity(codec::MAX_PACKET),
         }
     }
 
+    /// Sendepfad für den Desktop-Kanal (eigene Sequenzzähler, Stereo-Encoder).
+    pub fn new_desktop(sockets: Arc<Sockets>, shared: Arc<Shared>) -> Self {
+        Self::new(sockets, shared)
+    }
+
     /// Baut ein AUDIO-Paket in `self.buf` und verschickt es an die Ziele (direkt und per Relay).
     #[allow(clippy::too_many_arguments)]
-    fn ship(&mut self, seq: u32, muted: bool, payload_head: &[u8], data: Option<&[u8]>, direct: &[Option<SocketAddr>], relayed: &[Option<u64>]) {
+    fn ship(&mut self, seq: u32, muted: bool, payload_head: &[u8], data: Option<&[u8]>, direct: &[Option<SocketAddr>], relayed: &[Option<u64>], extra_flags: u8) {
         let room = self.shared.room.try_read().ok().and_then(|r| r.clone());
-        let mut flags = if muted { F_MUTED } else { 0 };
+        let mut flags = (if muted { F_MUTED } else { 0 }) | extra_flags;
         if room.is_some() {
             flags |= F_ENC;
         }
@@ -290,7 +303,7 @@ impl Wire {
         }
         let muted = self.shared.muted.load(Relaxed);
         if any_pcm {
-            let seq = self.shared.tx_seq.fetch_add(1, Relaxed) & !SEQ_OPUS;
+            let seq = self.shared.tx_seq.fetch_add(1, Relaxed) & SEQ_MASK;
             let frame_ms = (samples.len() as u32 * 1000 / RATE) as u8;
             let mut data = Vec::with_capacity(2 * samples.len());
             if !muted {
@@ -298,7 +311,7 @@ impl Wire {
                     data.extend_from_slice(&s.to_le_bytes());
                 }
             }
-            self.ship(seq, muted, &[CODEC_PCM, frame_ms], Some(&data), &pcm_direct, &pcm_relay);
+            self.ship(seq, muted, &[CODEC_PCM, frame_ms], Some(&data), &pcm_direct, &pcm_relay, 0);
         }
         if !any_opus {
             self.opus_acc.clear();
@@ -315,10 +328,81 @@ impl Wire {
         enc.set_kbps(kbps);
         let ok = if muted { false } else { enc.encode(&self.opus_acc[..codec::FRAME], &mut self.opus_pkt) };
         self.opus_acc.drain(..codec::FRAME);
-        let seq = SEQ_OPUS | (self.shared.tx_seq_opus.fetch_add(1, Relaxed) & !SEQ_OPUS);
+        let seq = SEQ_OPUS | (self.shared.tx_seq_opus.fetch_add(1, Relaxed) & SEQ_MASK);
         let head = [CODEC_OPUS, 10, kbps.min(255) as u8];
         let pkt = std::mem::take(&mut self.opus_pkt);
-        self.ship(seq, muted || !ok, &head, if ok { Some(&pkt) } else { None }, &opus_direct, &opus_relay);
+        self.ship(seq, muted || !ok, &head, if ok { Some(&pkt) } else { None }, &opus_direct, &opus_relay, 0);
+        self.opus_pkt = pkt;
+    }
+
+    /// Ein 10-ms-Stereo-Rahmen Desktop-Audio (960 interleaved Samples). LAN-Peers als PCM,
+    /// Ferne als Opus stereo; nur an Teilnehmer, deren Stimm-Platz einen Weg hat.
+    pub fn send_desktop_frame(&mut self, stereo: &[i16]) {
+        if stereo.len() != codec::FRAME * 2 {
+            return;
+        }
+        let kbps = self.shared.desktop_kbps.load(Relaxed).max(24);
+        let music = self.shared.desktop_music.load(Relaxed);
+        let mut pcm_direct: [Option<SocketAddr>; MAX_PEERS] = [None; MAX_PEERS];
+        let mut pcm_relay: [Option<u64>; MAX_PEERS] = [None; MAX_PEERS];
+        let mut opus_direct: [Option<SocketAddr>; MAX_PEERS] = [None; MAX_PEERS];
+        let mut opus_relay: [Option<u64>; MAX_PEERS] = [None; MAX_PEERS];
+        let mut any_pcm = false;
+        let mut any_opus = false;
+        let mut k = 0usize;
+        for p in self.shared.peers.iter() {
+            if !p.active.load(Relaxed) || p.kind.load(Relaxed) != KIND_VOICE || k >= MAX_PEERS {
+                continue;
+            }
+            let lan = p.path.load(Relaxed) == PATH_LAN;
+            if p.via_relay.load(Relaxed) {
+                let id = p.id.load(Relaxed);
+                if lan {
+                    pcm_relay[k] = Some(id);
+                    any_pcm = true;
+                } else {
+                    opus_relay[k] = Some(id);
+                    any_opus = true;
+                }
+                k += 1;
+            } else if let Ok(a) = p.addr.try_lock() {
+                if let Some(a) = *a {
+                    if lan {
+                        pcm_direct[k] = Some(a);
+                        any_pcm = true;
+                    } else {
+                        opus_direct[k] = Some(a);
+                        any_opus = true;
+                    }
+                    k += 1;
+                }
+            }
+        }
+        if any_pcm {
+            let seq = SEQ_DESK | (self.shared.tx_seq_desk.fetch_add(1, Relaxed) & SEQ_MASK);
+            let mut data = Vec::with_capacity(2 * stereo.len());
+            for s in stereo {
+                data.extend_from_slice(&s.to_le_bytes());
+            }
+            self.ship(seq, false, &[CODEC_PCM, 10, 0, 2], Some(&data), &pcm_direct, &pcm_relay, F_DESKTOP);
+        }
+        if !any_opus {
+            return;
+        }
+        if self.encoder.is_none() || self.enc_kbps != kbps || self.enc_music != music {
+            self.encoder = codec::Encoder::new_ch(kbps, 2, music);
+            self.enc_kbps = kbps;
+            self.enc_music = music;
+        }
+        let Some(enc) = self.encoder.as_mut() else { return };
+        let ok = enc.encode(stereo, &mut self.opus_pkt);
+        if !ok {
+            return;
+        }
+        let seq = SEQ_OPUS | SEQ_DESK | (self.shared.tx_seq_desk_opus.fetch_add(1, Relaxed) & SEQ_MASK);
+        let head = [CODEC_OPUS, 10, kbps.min(255) as u8, 2];
+        let pkt = std::mem::take(&mut self.opus_pkt);
+        self.ship(seq, false, &head, Some(&pkt), &opus_direct, &opus_relay, F_DESKTOP);
         self.opus_pkt = pkt;
     }
 }
@@ -341,6 +425,8 @@ struct Rx {
     /// Kleinster Füllstand seit dem letzten Regeltakt, für die Driftregelung.
     min_fill: usize,
     pads: u32,
+    /// Kanäle im Ring (1 Stimme, 2 Desktop).
+    ch: usize,
 }
 
 impl Rx {
@@ -358,6 +444,7 @@ impl Rx {
             last_shrink_ms: 0,
             min_fill: usize::MAX,
             pads: 0,
+            ch: 1,
         }
     }
 
@@ -629,6 +716,29 @@ fn peer_slot(shared: &Shared, table: &mut Table, id: u64, name: &str, addr: Opti
     Some(i)
 }
 
+/// Desktop-Platz zu einem bekannten Teilnehmer finden oder anlegen. None = kein Stimm-Platz oder voll.
+fn desktop_slot(shared: &Shared, table: &mut Table, id: u64, channels: u8, now: u64) -> Option<usize> {
+    let voice = shared.find_peer(id)?;
+    if let Some(i) = shared.find_desktop(id) {
+        if shared.peers[i].channels.load(Relaxed) != channels {
+            shared.peers[i].channels.store(channels, Relaxed);
+            table.slots[i].decoder = None;
+            table.slots[i].rx.reset(codec::FRAME, now);
+            table.slots[i].rx.ch = channels as usize;
+        }
+        return Some(i);
+    }
+    let i = shared.free_slot()?;
+    let v = &shared.peers[voice];
+    shared.peers[i].assign_kind(id, &v.name(), None, v.path.load(Relaxed), now, shared.initial_target(), shared.default_volume_f(), KIND_DESKTOP, channels);
+    table.slots[i].rx.reset(codec::FRAME, now);
+    table.slots[i].rx.ch = channels as usize;
+    table.slots[i].decoder = None;
+    table.slots[i].codec = CODEC_PCM;
+    eprintln!("Desktop-Audio von {} ({} Kanäle) auf Platz {i}", v.name(), channels);
+    Some(i)
+}
+
 /// Bestätigten Direktweg übernehmen, wenn er besser ist als der aktuelle.
 fn adopt_direct(shared: &Shared, i: usize, src: SocketAddr, now: u64) {
     let p = &shared.peers[i];
@@ -798,25 +908,46 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
                 return;
             }
             let in_codec = payload[0];
-            let Some(i) = peer_slot(shared, table, h.sender, "", if from_hub { None } else { Some(src) }, now_ms) else {
-                shared.room_full.store(true, Relaxed);
-                return;
+            let is_desktop = h.flags & F_DESKTOP != 0;
+            // Kopf: Stimme [codec][ms] bzw. [codec][ms][kbps]; Desktop [codec][ms][kbps][kanäle].
+            let (head_len, ch) = if is_desktop {
+                if payload.len() < 4 {
+                    return;
+                }
+                (4usize, payload[3].clamp(1, 2) as usize)
+            } else if in_codec == CODEC_OPUS {
+                (3usize, 1usize)
+            } else {
+                (2usize, 1usize)
+            };
+            let in_kbps = if head_len >= 3 { payload[2] as u32 } else { 0 };
+            let muted = h.flags & F_MUTED != 0 && !is_desktop;
+            let now_us = shared.now_us();
+            let i = if is_desktop {
+                let Some(i) = desktop_slot(shared, table, h.sender, ch as u8, now_ms) else { return };
+                i
+            } else {
+                let Some(i) = peer_slot(shared, table, h.sender, "", if from_hub { None } else { Some(src) }, now_ms) else {
+                    shared.room_full.store(true, Relaxed);
+                    return;
+                };
+                i
             };
             let p = &shared.peers[i];
-            let muted = h.flags & F_MUTED != 0;
-            let now_us = shared.now_us();
-            p.remote_muted.store(muted, Relaxed);
             p.last_rx_ms.store(now_ms, Relaxed);
             p.last_seen_ms.store(now_ms, Relaxed);
-            if from_hub {
-                if p.addr().is_none() {
-                    p.path.store(PATH_RELAY, Relaxed);
+            if !is_desktop {
+                p.remote_muted.store(muted, Relaxed);
+                if from_hub {
+                    if p.addr().is_none() {
+                        p.path.store(PATH_RELAY, Relaxed);
+                    }
+                } else if p.addr().is_none() && !p.via_relay.load(Relaxed) {
+                    // Direktes Audio ohne vorherigen Handschlag (offenes LAN): Adresse übernehmen.
+                    adopt_direct(shared, i, src, now_ms);
                 }
-            } else if p.addr().is_none() && !p.via_relay.load(Relaxed) {
-                // Direktes Audio ohne vorherigen Handschlag (offenes LAN): Adresse übernehmen.
-                adopt_direct(shared, i, src, now_ms);
             }
-            if h.seq % 200 == 0 {
+            if !is_desktop && h.seq % 200 == 0 {
                 let mut pong = Vec::with_capacity(HEADER);
                 write_header(&mut pong, &Header { typ: T_PONG, flags: 0, sender: shared.peer_id, seq: 0, ts: h.ts });
                 if from_hub {
@@ -832,6 +963,7 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
             }
 
             let slot = &mut table.slots[i];
+            slot.rx.ch = ch;
             if slot.codec != in_codec {
                 // Codec-Wechsel: eigener Sequenzraum, daher Zähler neu ansetzen.
                 slot.codec = in_codec;
@@ -839,18 +971,16 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
                 slot.rx.last_frame.clear();
                 p.codec.store(in_codec, Relaxed);
             }
+            let raw = &payload[head_len..];
             let mut decoded: Vec<i16> = Vec::new();
             let samples: &[i16] = if in_codec == CODEC_OPUS {
-                if payload.len() < 3 {
-                    return;
-                }
-                p.codec_kbps.store(payload[2] as u32, Relaxed);
+                p.codec_kbps.store(in_kbps, Relaxed);
                 if slot.decoder.is_none() {
-                    slot.decoder = codec::Decoder::new();
+                    slot.decoder = codec::Decoder::new_ch(ch);
                 }
                 let Some(dec) = slot.decoder.as_mut() else { return };
-                if !muted && payload.len() > 3 {
-                    if !dec.decode(&payload[3..], &mut decoded) {
+                if !muted && !raw.is_empty() {
+                    if !dec.decode(raw, &mut decoded) {
                         return;
                     }
                 }
@@ -860,17 +990,18 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
                 &[]
             };
             let rx = &mut slot.rx;
-            let raw = &payload[2..];
+            // ns = Rahmen je Kanal, nss = Samples im Ring
             let ns = if muted {
                 if in_codec == CODEC_OPUS { codec::FRAME } else { rx.last_ns }
             } else if in_codec == CODEC_OPUS {
-                samples.len()
+                samples.len() / ch
             } else {
-                raw.len() / 2
+                raw.len() / 2 / ch
             };
             if ns == 0 {
                 return;
             }
+            let nss = ns * ch;
             if !muted {
                 rx.last_ns = ns;
                 p.frame_samples.store(ns as u32, Relaxed);
@@ -904,7 +1035,7 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
                                     let _ = slot.producer.push(s / 2);
                                 }
                             } else {
-                                for _ in 0..ns {
+                                for _ in 0..nss {
                                     let _ = slot.producer.push(0);
                                 }
                             }
@@ -920,13 +1051,13 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
             rx.min_fill = rx.min_fill.min(fill);
             // Überlauf erst deutlich über dem Ziel: Jitter-Schübe sollen den Puffer
             // wachsen lassen, nicht Pakete kosten. Zurückgeregelt wird per Drift-Skip.
-            if fill + ns > (target + 4) * ns {
+            if fill + nss > (target + 4) * nss {
                 p.dropped.fetch_add(1, Relaxed);
                 return;
             }
             rx.last_frame.clear();
             if muted {
-                for _ in 0..ns {
+                for _ in 0..nss {
                     let _ = slot.producer.push(0);
                 }
             } else if in_codec == CODEC_OPUS {
@@ -942,7 +1073,7 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
                 }
             }
             let fill = slot.capacity - slot.producer.slots();
-            if p.priming.load(Relaxed) && fill >= target * ns {
+            if p.priming.load(Relaxed) && fill >= target * nss {
                 p.priming.store(false, Relaxed);
             }
         }
@@ -958,7 +1089,7 @@ fn handle(pkt: &[u8], src: SocketAddr, sockets: &Sockets, shared: &Shared, table
         T_LEAVE => {
             if let Some(i) = shared.find_peer(h.sender) {
                 eprintln!("Teilnehmer {} hat den Raum verlassen", shared.peers[i].name());
-                shared.peers[i].clear();
+                shared.clear_id(h.sender);
             }
         }
         _ => {}
@@ -972,9 +1103,16 @@ fn stats_and_control(shared: &Shared, table: &mut Table, now: u64) {
         if !p.active.load(Relaxed) {
             continue;
         }
-        if now.saturating_sub(p.last_seen_ms.load(Relaxed)) > crate::state::GONE_MS {
+        let is_desktop = p.kind.load(Relaxed) == KIND_DESKTOP;
+        if is_desktop {
+            let voice_gone = shared.find_peer(p.id.load(Relaxed)).is_none();
+            if voice_gone || now.saturating_sub(p.last_rx_ms.load(Relaxed)) > DESKTOP_GONE_MS {
+                p.clear();
+                continue;
+            }
+        } else if now.saturating_sub(p.last_seen_ms.load(Relaxed)) > crate::state::GONE_MS {
             eprintln!("Teilnehmer {} weg (keine Lebenszeichen)", p.name());
-            p.clear();
+            shared.clear_id(p.id.load(Relaxed));
             continue;
         }
         let slot = &mut table.slots[i];
@@ -1004,12 +1142,13 @@ fn stats_and_control(shared: &Shared, table: &mut Table, now: u64) {
         // Driftregelung: läuft der Ring fast leer, einen Rahmen vorab doppelt einsetzen;
         // ist er dauerhaft übervoll, einen Rahmen verwerfen. Beides ohne Aussetzer.
         let ns = rx.last_ns.max(1);
+        let nss = ns * rx.ch.max(1);
         let min_fill = std::mem::replace(&mut rx.min_fill, usize::MAX);
         let target_now = p.target_frames.load(Relaxed) as usize;
         if min_fill != usize::MAX && p.streaming(now) && !p.priming.load(Relaxed) {
-            if min_fill < ns / 2 {
+            if min_fill < nss / 2 {
                 if rx.last_frame.is_empty() {
-                    for _ in 0..ns {
+                    for _ in 0..nss {
                         let _ = slot.producer.push(0);
                     }
                 } else {
@@ -1018,8 +1157,8 @@ fn stats_and_control(shared: &Shared, table: &mut Table, now: u64) {
                     }
                 }
                 rx.pads += 1;
-            } else if min_fill > (target_now + 1) * ns {
-                p.skip_samples.fetch_add(ns as u32, Relaxed);
+            } else if min_fill > (target_now + 1) * nss {
+                p.skip_samples.fetch_add(nss as u32, Relaxed);
             }
         }
         let mut target = p.target_frames.load(Relaxed);
@@ -1046,7 +1185,7 @@ fn stats_and_control(shared: &Shared, table: &mut Table, now: u64) {
             {
                 target -= 1;
                 rx.last_shrink_ms = now;
-                p.skip_samples.fetch_add(rx.last_ns as u32, Relaxed);
+                p.skip_samples.fetch_add((rx.last_ns * rx.ch.max(1)) as u32, Relaxed);
             }
         }
         p.target_frames.store(target.clamp(MIN_TARGET, MAX_TARGET), Relaxed);

@@ -11,6 +11,12 @@ use std::time::Instant;
 /// Drahtformat: 48 kHz mono int16, unabhängig von den Geräten.
 pub const RATE: u32 = 48_000;
 pub const MAX_PEERS: usize = 8;
+/// Plätze: je Person Stimme + Desktop.
+pub const SLOTS: usize = MAX_PEERS * 2;
+pub const KIND_VOICE: u8 = 0;
+pub const KIND_DESKTOP: u8 = 1;
+/// Desktop-Kanal ohne Audio so lange → Platz frei.
+pub const DESKTOP_GONE_MS: u64 = 5000;
 pub const MIN_TARGET: u32 = 1;
 pub const MAX_TARGET: u32 = 8;
 /// Annahme für die Anzeige: WASAPI Shared Mode arbeitet mit 10-ms-Perioden.
@@ -81,6 +87,10 @@ pub enum JitterMode {
 pub struct Peer {
     pub active: AtomicBool,
     pub id: AtomicU64,
+    /// KIND_VOICE oder KIND_DESKTOP
+    pub kind: AtomicU8,
+    /// 1 = mono, 2 = stereo interleaved im Ring
+    pub channels: AtomicU8,
     pub name: Mutex<String>,
     pub addr: Mutex<Option<SocketAddr>>,
     pub path: AtomicU8,
@@ -117,6 +127,8 @@ impl Peer {
         Peer {
             active: AtomicBool::new(false),
             id: AtomicU64::new(0),
+            kind: AtomicU8::new(KIND_VOICE),
+            channels: AtomicU8::new(1),
             name: Mutex::new(String::new()),
             addr: Mutex::new(None),
             path: AtomicU8::new(PATH_UNKNOWN),
@@ -149,6 +161,13 @@ impl Peer {
     /// Platz für einen neuen Teilnehmer herrichten. `active` zuletzt, damit der Mixer nichts Halbes sieht.
     #[allow(clippy::too_many_arguments)]
     pub fn assign(&self, id: u64, name: &str, addr: Option<SocketAddr>, path: u8, now_ms: u64, target: u32, volume: f32) {
+        self.assign_kind(id, name, addr, path, now_ms, target, volume, KIND_VOICE, 1);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn assign_kind(&self, id: u64, name: &str, addr: Option<SocketAddr>, path: u8, now_ms: u64, target: u32, volume: f32, kind: u8, channels: u8) {
+        self.kind.store(kind, Relaxed);
+        self.channels.store(channels, Relaxed);
         self.id.store(id, Relaxed);
         if let Ok(mut n) = self.name.lock() {
             *n = name.to_string();
@@ -236,7 +255,7 @@ pub struct Shared {
     pub default_volume: AtomicU32,
     pub jitter_auto: AtomicBool,
     pub jitter_fixed: AtomicU32,
-    pub peers: [Peer; MAX_PEERS],
+    pub peers: [Peer; SLOTS],
     pub room: RwLock<Option<Arc<Room>>>,
     pub room_busy: AtomicBool,
     pub room_full: AtomicBool,
@@ -258,6 +277,16 @@ pub struct Shared {
     pub force_relay: AtomicBool,
     /// Gemerkte Lautstärken je Kennung (linear).
     pub volumes: Mutex<HashMap<u64, f32>>,
+    /// Desktop-Audio (Sender): an, Bitrate für Ferne, Musikprofil, Sendepegel, Anzeige, Quelle.
+    pub desktop_on: AtomicBool,
+    pub desktop_kbps: AtomicU32,
+    pub desktop_music: AtomicBool,
+    pub desktop_gain: AtomicU32,
+    pub desktop_level: AtomicU32,
+    pub desktop_source: Mutex<String>,
+    pub desktop_error: Mutex<Option<String>>,
+    pub tx_seq_desk: AtomicU32,
+    pub tx_seq_desk_opus: AtomicU32,
 }
 
 impl Shared {
@@ -296,6 +325,15 @@ impl Shared {
             jitter_auto: AtomicBool::new(auto),
             jitter_fixed: AtomicU32::new(fixed),
             peers: std::array::from_fn(|_| Peer::new()),
+            desktop_on: AtomicBool::new(false),
+            desktop_kbps: AtomicU32::new(96),
+            desktop_music: AtomicBool::new(false),
+            desktop_gain: AtomicU32::new(1.0f32.to_bits()),
+            desktop_level: AtomicU32::new(0),
+            desktop_source: Mutex::new(String::from("all")),
+            desktop_error: Mutex::new(None),
+            tx_seq_desk: AtomicU32::new(0),
+            tx_seq_desk_opus: AtomicU32::new(0),
             room: RwLock::new(None),
             room_busy: AtomicBool::new(false),
             room_full: AtomicBool::new(false),
@@ -447,8 +485,31 @@ impl Shared {
         self.foreign_room.store(0, Relaxed);
     }
 
+    /// Stimm-Platz einer Kennung.
     pub fn find_peer(&self, id: u64) -> Option<usize> {
-        self.peers.iter().position(|p| p.active.load(Relaxed) && p.id.load(Relaxed) == id)
+        self.peers.iter().position(|p| p.active.load(Relaxed) && p.id.load(Relaxed) == id && p.kind.load(Relaxed) == KIND_VOICE)
+    }
+
+    /// Desktop-Platz einer Kennung.
+    pub fn find_desktop(&self, id: u64) -> Option<usize> {
+        self.peers.iter().position(|p| p.active.load(Relaxed) && p.id.load(Relaxed) == id && p.kind.load(Relaxed) == KIND_DESKTOP)
+    }
+
+    /// Stimm- und Desktop-Platz einer Kennung freigeben.
+    pub fn clear_id(&self, id: u64) {
+        for p in &self.peers {
+            if p.active.load(Relaxed) && p.id.load(Relaxed) == id {
+                p.clear();
+            }
+        }
+    }
+
+    pub fn desktop_gain_f(&self) -> f32 {
+        f32::from_bits(self.desktop_gain.load(Relaxed))
+    }
+
+    pub fn desktop_level_f(&self) -> f32 {
+        f32::from_bits(self.desktop_level.load(Relaxed))
     }
 
     pub fn free_slot(&self) -> Option<usize> {
@@ -462,8 +523,9 @@ impl Shared {
         self.room_full.store(false, Relaxed);
     }
 
+    /// Personen (Stimm-Plätze).
     pub fn peer_count(&self) -> usize {
-        self.peers.iter().filter(|p| p.active.load(Relaxed)).count()
+        self.peers.iter().filter(|p| p.active.load(Relaxed) && p.kind.load(Relaxed) == KIND_VOICE).count()
     }
 
     /// Mindestens ein Teilnehmer liefert gerade Audio.
@@ -498,8 +560,9 @@ impl Shared {
         };
         let mut peers = Vec::new();
         for p in self.peers.iter().filter(|p| p.active.load(Relaxed)) {
+            let kind = if p.kind.load(Relaxed) == KIND_DESKTOP { "desk:" } else { "" };
             peers.push(format!(
-                "{}{}[{} {} rtt{:.0} jit{:.0} buf{}/{:.0}ms und{} drop{} {}]",
+                "{}{kind}{}[{} {} rtt{:.0} jit{:.0} buf{}/{:.0}ms und{} drop{} {}]",
                 if p.streaming(now) { "●" } else { "○" },
                 p.name(),
                 path_name(p.path.load(Relaxed)),

@@ -270,3 +270,78 @@ protokollinkompatibel zu 0.2, also beide Rechner gleichzeitig aktualisieren
    Rahmen, Vorausschau 0. RNNoise bleibt Sprachdetektor für die Sperre und
    Rückfall. Exe 10 → 62 MB. Version 1.2.0 (6.9.): Linux/macOS-Builds, cargo test
    in CI, Hub-Healthcheck, Whiskers-Alarmregel.
+
+
+## 10. Desktop-Audio (Entwurf 8. September 2026, vom Nutzer entschieden)
+
+**Ziel:** Wer will, sendet zusätzlich zur Stimme, was auf seinem Rechner läuft
+(Spielsound, Musik). Opt-in je Sender, eigener Kanal je Person, stereo, bei den
+Empfängern getrennt regelbar. Alle Plattformen.
+
+**Entscheidungen:** eigener Kanal statt Beimischen; Qualität umschaltbar (Spiel
+/ Musik); Windows, Linux und macOS.
+
+### Quelle je Plattform
+
+| Plattform | Quelle | Echo-Schutz |
+|---|---|---|
+| Windows | Prozess-Loopback (WASAPI, ab Windows 10 2004): „Alles ausser Holler“ (eigener Prozessbaum ausgeschlossen) oder „Nur Programm …“ (Liste laufender Programme mit Ton) | eingebaut, Hollers Ausgabe ist nie enthalten |
+| Linux | ein Aufnahmegerät aus der Liste, üblicherweise „Monitor of …“ (PipeWire/Pulse) | Hinweis im Fenster: Holler auf ein anderes Ausgabegerät legen, sonst hört das Gegenüber sich selbst |
+| macOS | ein Aufnahmegerät aus der Liste, üblicherweise ein virtuelles Gerät (BlackHole) mit Multi-Output | wie Linux |
+
+Ohne passende Quelle bleibt die Option grau mit Erklärung.
+
+### Protokoll
+
+- Zweiter Audiostrom je Sender, Kopf-Flag Bit 3 = Desktop. Eigener
+  Sequenzraum (Bit 30), damit die Nonce je Schlüssel eindeutig bleibt; Bit 31
+  bleibt Opus.
+- Nutzlast wie AUDIO, aber `[codec][rahmen ms][kbps][kanäle=2][daten]`.
+  Stereo interleaved. LAN: PCM stereo 5 ms (1,5 Mbit/s). Fern: Opus stereo
+  10 ms, Spiel 96 kbit/s (VoIP-Profil aus, Audio-Profil), Musik 160 kbit/s.
+- Kein Desktop-Strom, wenn die Option aus ist (kein Stumm-Flag nötig).
+
+### Empfänger
+
+- Je Person ein zweiter Platz (Art „Desktop“) mit eigenem Jitter-Puffer,
+  Driftregelung, Decoder (stereo), Lautstärke und „Ton aus“. Die
+  Teilnehmerliste zeigt unter der Stimme eine zweite Zeile „Desktop“ mit
+  Pegel, Regler und Schalter, sobald etwas ankommt.
+- Der Mixer wird stereo: Stimmen mono auf beide Kanäle, Desktop links/rechts.
+  Plätze: 8 Personen × 2 = 16.
+
+### Sender, im Fenster: Karte „Desktop-Audio“
+
+```
+DESKTOP-AUDIO
+ ☐ Desktop-Audio senden
+ Quelle   [ Alles ausser Holler ▾ ]    (Windows: dazu „Nur Programm …“ mit Liste)
+ Qualität [ Spiel · Opus 96 ▾ ]        Erklärzeile: Spiel = Stereo, 96 kbit/s, Sprachtauglich. Musik = 160 kbit/s, Musikprofil.
+ ▮▮▮▮▮▯▯▯▯▯  Pegel
+ Lautstärke ────●──── 100 %             (Sendepegel, unabhängig von der Stimme)
+```
+
+Keine Rauschunterdrückung und keine Sperre auf diesem Kanal. Stumm (F9)
+betrifft nur die Stimme; Desktop-Audio hat seinen eigenen Haken.
+
+### Grenzen, vorab gesagt
+
+- Discord-Ton würde unter „Alles ausser Holler“ mitgesendet; wer Discord parallel
+  nutzt, nimmt „Nur Programm: Spiel“.
+- Linux/macOS ohne Prozess-Loopback: Echo-Schutz nur durch getrennte Ausgabegeräte.
+- Bandbreite je Desktop-Sender: 96–160 kbit/s je Empfänger im Internet, im LAN
+  1,5 Mbit/s je Empfänger.
+
+### Schritte
+
+1. Protokoll, Plätze, Stereo-Mixer, Empfängerliste, Sender über beliebiges
+   Aufnahmegerät (alle Plattformen) → funktioniert sofort unter Linux/macOS mit
+   Monitor/BlackHole.
+2. Windows: Prozess-Loopback über die Bibliothek `wasapi` (Alles ausser Holler,
+   Nur Programm) mit Programmliste aus den Audiositzungen.
+3. Release 1.4.0.
+
+**Umgesetzt am 8. September 2026 als 1.4.0**: alle drei Schritte in einem Zug,
+Plätze 16, Stereo-Mixer, `src/desktop.rs` mit Prozess-Loopback (`wasapi`) und
+Gerätepfad (cpal), Programmliste aus den Audiositzungen. Zwei-Instanzen-Test
+LAN (PCM stereo) und Relay über den Hub (Opus stereo) bestanden.

@@ -4,7 +4,8 @@
 use crate::audio::{self, Capture, Consumers, Devices, Playback};
 use crate::config::Config;
 use crate::net::{self, NetCfg, Sockets, Wire};
-use crate::state::{Shared, MAX_PEERS};
+use crate::desktop;
+use crate::state::{Shared, SLOTS};
 use std::sync::{Arc, Mutex};
 
 pub struct Engine {
@@ -15,6 +16,7 @@ pub struct Engine {
     pub out_error: Option<String>,
     capture: Option<Capture>,
     playback: Option<Playback>,
+    desktop: Option<desktop::Capture>,
     consumers: Consumers,
     pub sockets: Arc<Sockets>,
     shared: Arc<Shared>,
@@ -28,10 +30,10 @@ pub enum EngineError {
 impl Engine {
     pub fn new(cfg: &Config, shared: Arc<Shared>) -> Result<Engine, EngineError> {
         let sockets = Sockets::bind(cfg.port).map_err(EngineError::Port)?;
-        let mut producers = Vec::with_capacity(MAX_PEERS);
-        let mut consumers = Vec::with_capacity(MAX_PEERS);
-        for _ in 0..MAX_PEERS {
-            let (p, c) = rtrb::RingBuffer::<i16>::new(48_000);
+        let mut producers = Vec::with_capacity(SLOTS);
+        let mut consumers = Vec::with_capacity(SLOTS);
+        for _ in 0..SLOTS {
+            let (p, c) = rtrb::RingBuffer::<i16>::new(96_000);
             producers.push(p);
             consumers.push(c);
         }
@@ -61,6 +63,7 @@ impl Engine {
             out_error: None,
             capture: None,
             playback: None,
+            desktop: None,
             consumers: Arc::new(Mutex::new(consumers)),
             sockets,
             shared,
@@ -110,6 +113,36 @@ impl Engine {
 
     pub fn output_name(&self) -> Option<&str> {
         self.out_idx.and_then(|i| self.devices.outputs.get(i)).map(|(n, _)| n.as_str())
+    }
+
+    /// Desktop-Audio starten/stoppen; Quelle aus dem gemeinsamen Zustand.
+    pub fn set_desktop(&mut self, on: bool) {
+        self.desktop = None;
+        if let Ok(mut e) = self.shared.desktop_error.lock() {
+            *e = None;
+        }
+        self.shared.desktop_on.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.shared.desktop_level.store(0, std::sync::atomic::Ordering::Relaxed);
+        if !on {
+            return;
+        }
+        let src = desktop::Source::parse(&self.shared.desktop_source.lock().map(|s| s.clone()).unwrap_or_default());
+        match desktop::start(&src, self.shared.clone(), self.sockets.clone(), &self.devices) {
+            Ok(c) => {
+                self.desktop = Some(c);
+                self.shared.desktop_on.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                eprintln!("Desktop-Audio: {e}");
+                if let Ok(mut g) = self.shared.desktop_error.lock() {
+                    *g = Some(e);
+                }
+            }
+        }
+    }
+
+    pub fn desktop_running(&self) -> bool {
+        self.desktop.is_some()
     }
 
     /// Den anderen Bescheid sagen, bevor wir gehen.

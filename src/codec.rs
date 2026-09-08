@@ -41,14 +41,21 @@ pub fn choice_key(kbps: u32) -> &'static str {
 pub struct Encoder {
     inner: OpusEncoder,
     kbps: u32,
+    channels: usize,
 }
 
 impl Encoder {
     pub fn new(kbps: u32) -> Option<Self> {
-        let mut inner = OpusEncoder::new(48_000, 1, Application::Voip).ok()?;
+        Self::new_ch(kbps, 1, false)
+    }
+
+    /// `music` = Audio-Profil (Musik/Spielsound) statt Sprachprofil.
+    pub fn new_ch(kbps: u32, channels: usize, music: bool) -> Option<Self> {
+        let app = if music { Application::Audio } else { Application::Voip };
+        let mut inner = OpusEncoder::new(48_000, channels, app).ok()?;
         inner.bitrate_bps = (kbps.max(6) * 1000) as i32;
         inner.complexity = 6;
-        Some(Encoder { inner, kbps })
+        Some(Encoder { inner, kbps, channels })
     }
 
     #[allow(dead_code)]
@@ -63,9 +70,9 @@ impl Encoder {
         }
     }
 
-    /// Kodiert genau FRAME Samples in `out` (wird passend gekürzt).
+    /// Kodiert genau FRAME Rahmen (interleaved bei stereo) in `out` (wird passend gekürzt).
     pub fn encode(&mut self, pcm: &[i16], out: &mut Vec<u8>) -> bool {
-        if pcm.len() != FRAME {
+        if pcm.len() != FRAME * self.channels {
             return false;
         }
         out.clear();
@@ -85,20 +92,26 @@ impl Encoder {
 
 pub struct Decoder {
     inner: OpusDecoder,
+    channels: usize,
 }
 
 impl Decoder {
+    #[allow(dead_code)]
     pub fn new() -> Option<Self> {
-        Some(Decoder { inner: OpusDecoder::new(48_000, 1).ok()? })
+        Self::new_ch(1)
+    }
+
+    pub fn new_ch(channels: usize) -> Option<Self> {
+        Some(Decoder { inner: OpusDecoder::new(48_000, channels).ok()?, channels })
     }
 
     /// Dekodiert ein Paket nach `out` (FRAME Samples). Leeres Paket = Verlustverschleierung.
     pub fn decode(&mut self, packet: &[u8], out: &mut Vec<i16>) -> bool {
         out.clear();
-        out.resize(FRAME, 0);
+        out.resize(FRAME * self.channels, 0);
         match self.inner.decode_s16(packet, FRAME, out) {
             Ok(n) if n > 0 => {
-                out.truncate(n);
+                out.truncate(n * self.channels);
                 true
             }
             _ => {
@@ -155,5 +168,28 @@ mod tests {
         assert_eq!(parse_choice("Opus64"), 64);
         assert_eq!(parse_choice("pcm"), 0);
         assert_eq!(choice_key(parse_choice("unsinn")), "opus32");
+    }
+
+    #[test]
+    fn stereo_rundlauf() {
+        let mut enc = Encoder::new_ch(96, 2, true).expect("stereo");
+        let mut dec = Decoder::new_ch(2).expect("stereo");
+        let mut pkt = Vec::new();
+        let mut out = Vec::new();
+        for f in 0..20 {
+            let frame: Vec<i16> = (0..FRAME * 2)
+                .map(|i| {
+                    let t = (f * FRAME + i / 2) as f64 / 48_000.0;
+                    let hz = if i % 2 == 0 { 440.0 } else { 660.0 };
+                    ((t * hz * std::f64::consts::TAU).sin() * 8000.0) as i16
+                })
+                .collect();
+            assert!(enc.encode(&frame, &mut pkt));
+            assert!(dec.decode(&pkt, &mut out));
+            assert_eq!(out.len(), FRAME * 2);
+        }
+        let l = rms(&out.iter().step_by(2).copied().collect::<Vec<_>>());
+        let r = rms(&out.iter().skip(1).step_by(2).copied().collect::<Vec<_>>());
+        assert!(l > 2000.0 && r > 2000.0, "beide Kanäle müssen Pegel haben: {l} {r}");
     }
 }

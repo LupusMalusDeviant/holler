@@ -9,6 +9,7 @@ mod audio;
 mod codec;
 mod config;
 mod crypto;
+mod desktop;
 mod engine;
 mod icon;
 mod invite;
@@ -64,6 +65,15 @@ struct Args {
     /// Qualität für Ferne: pcm, opus64, opus32, opus16
     #[arg(long)]
     codec: Option<String>,
+    /// Desktop-Audio senden: on oder off
+    #[arg(long)]
+    desktop: Option<String>,
+    /// Desktop-Quelle: all, pid:<nr>, dev:<Gerätename>
+    #[arg(long = "desktop-source")]
+    desktop_source: Option<String>,
+    /// Desktop-Qualität: spiel (Opus 96) oder musik (Opus 160)
+    #[arg(long = "desktop-quality")]
+    desktop_quality: Option<String>,
     /// Anzeigename bei den anderen
     #[arg(long)]
     name: Option<String>,
@@ -112,6 +122,9 @@ struct Args {
     /// Geräte mit Index ausgeben und beenden
     #[arg(long = "list-devices")]
     list_devices: bool,
+    /// Programme mit Tonausgabe (Desktop-Quellen) ausgeben und beenden
+    #[arg(long = "list-desktop-sources")]
+    list_desktop_sources: bool,
 }
 
 fn main() {
@@ -130,12 +143,15 @@ fn main() {
     if let Some(inv) = &invite {
         cfg.room = inv.room.clone();
         cfg.room_password = inv.password.clone();
-        if let Some(h) = &inv.hub { cfg.hub = h.clone(); }
+        if let Some(h) = &inv.hub { cfg.hub = if h.trim().eq_ignore_ascii_case("off") { String::new() } else { h.clone() }; }
     }
     if let Some(v) = &args.room { cfg.room = v.clone(); }
     if let Some(v) = &args.room_password { cfg.room_password = v.clone(); }
     if let Some(v) = &args.hub { cfg.hub = if v.trim().eq_ignore_ascii_case("off") { String::new() } else { v.clone() }; }
     if let Some(v) = &args.codec { cfg.codec = codec::choice_key(codec::parse_choice(v)).to_string(); }
+    if let Some(v) = &args.desktop { cfg.desktop_on = v.trim().eq_ignore_ascii_case("on"); }
+    if let Some(v) = &args.desktop_source { cfg.desktop_source = v.clone(); }
+    if let Some(v) = &args.desktop_quality { cfg.desktop_quality = v.clone(); }
     if let Some(v) = args.name { cfg.name = v; }
     if let Some(v) = args.input { cfg.input = Some(v); }
     if let Some(v) = args.output { cfg.output = Some(v); }
@@ -151,6 +167,21 @@ fn main() {
     if let Some(v) = args.hotkey { cfg.hotkey = v; }
     if let Some(v) = args.headset_ms { cfg.headset_ms = v; }
     if args.no_update_check { cfg.update_check = false; }
+
+    if args.list_desktop_sources {
+        println!("Desktop-Quellen:");
+        if cfg!(windows) {
+            println!("  all                     Alles ausser Holler");
+            for (pid, name) in desktop::list_processes() {
+                println!("  pid:{pid:<8}            Nur {name}");
+            }
+        }
+        let host = cpal::default_host();
+        for (n, _) in audio::enumerate(&host).inputs {
+            println!("  dev:{n}");
+        }
+        return;
+    }
 
     if args.list_devices {
         let host = cpal::default_host();
@@ -194,7 +225,7 @@ fn main() {
         cfg.gate(),
         cfg.denoise,
     ));
-    let engine = match Engine::new(&cfg, shared.clone()) {
+    let mut engine = match Engine::new(&cfg, shared.clone()) {
         Ok(e) => e,
         Err(EngineError::Port(e)) => {
             eprintln!("{e}");
@@ -233,6 +264,16 @@ fn main() {
         }
     }
     shared.codec_kbps.store(codec::parse_choice(&cfg.codec), std::sync::atomic::Ordering::Relaxed);
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let music = cfg.desktop_quality.trim().eq_ignore_ascii_case("musik");
+        shared.desktop_music.store(music, Relaxed);
+        shared.desktop_kbps.store(if music { 160 } else { 96 }, Relaxed);
+        shared.desktop_gain.store((cfg.desktop_gain.min(300) as f32 / 100.0).to_bits(), Relaxed);
+        if let Ok(mut g) = shared.desktop_source.lock() {
+            *g = cfg.desktop_source.clone();
+        }
+    }
     shared.force_relay.store(args.force_relay, std::sync::atomic::Ordering::Relaxed);
     if let Some(e) = shared.hub_error.lock().ok().and_then(|g| g.clone()) {
         eprintln!("{e}");
@@ -243,6 +284,10 @@ fn main() {
         eprintln!("Berechne Raumschlüssel für „{}“ …", cfg.room.trim());
         shared.set_room(Some(crypto::derive(&cfg.room, &cfg.room_password)));
         eprintln!("Raum „{}“ beigetreten, Pakete verschlüsselt.", cfg.room.trim());
+    }
+
+    if cfg.desktop_on {
+        engine.set_desktop(true);
     }
 
     if args.headless {

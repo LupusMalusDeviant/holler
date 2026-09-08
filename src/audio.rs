@@ -3,7 +3,7 @@
 //! linear umgerechnet, damit auch 16-kHz-Funkmikros und 44,1-kHz-Ausgaben gehen.
 
 use crate::net::Wire;
-use crate::state::{Shared, MAX_PEERS, RATE};
+use crate::state::{Shared, KIND_DESKTOP, RATE, SLOTS};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SizedSample};
 use std::sync::atomic::Ordering::Relaxed;
@@ -48,18 +48,18 @@ pub fn find(list: &[(String, cpal::Device)], wanted: &Option<String>, default_na
 }
 
 /// Umrechnung beim Aufnehmen: Geräterate → 48 kHz, chunkweise.
-struct PushResampler {
+pub struct PushResampler {
     ratio: f64,
     pos: f64,
     last: f32,
 }
 
 impl PushResampler {
-    fn new(from: u32, to: u32) -> Self {
+    pub fn new(from: u32, to: u32) -> Self {
         PushResampler { ratio: from as f64 / to as f64, pos: 0.0, last: 0.0 }
     }
 
-    fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
+    pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
         if input.is_empty() {
             return;
         }
@@ -81,28 +81,28 @@ impl PushResampler {
     }
 }
 
-/// Umrechnung beim Abspielen: 48 kHz → Geräterate, ziehend.
-struct PullResampler {
+/// Umrechnung beim Abspielen: 48 kHz → Geräterate, ziehend, als Stereo-Paar.
+struct PullResampler2 {
     ratio: f64,
     pos: f64,
-    prev: f32,
-    cur: f32,
+    prev: [f32; 2],
+    cur: [f32; 2],
 }
 
-impl PullResampler {
+impl PullResampler2 {
     fn new(from: u32, to: u32) -> Self {
-        PullResampler { ratio: from as f64 / to as f64, pos: 1.0, prev: 0.0, cur: 0.0 }
+        PullResampler2 { ratio: from as f64 / to as f64, pos: 1.0, prev: [0.0; 2], cur: [0.0; 2] }
     }
 
-    fn next(&mut self, mut pull: impl FnMut() -> Option<f32>) -> Option<f32> {
+    fn next(&mut self, mut pull: impl FnMut() -> [f32; 2]) -> [f32; 2] {
         self.pos += self.ratio;
         while self.pos >= 1.0 {
-            let v = pull()?;
             self.prev = self.cur;
-            self.cur = v;
+            self.cur = pull();
             self.pos -= 1.0;
         }
-        Some(self.prev + (self.cur - self.prev) * self.pos as f32)
+        let t = self.pos as f32;
+        [self.prev[0] + (self.cur[0] - self.prev[0]) * t, self.prev[1] + (self.cur[1] - self.prev[1]) * t]
     }
 }
 
@@ -307,7 +307,8 @@ fn limit(x: f32) -> f32 {
     }
 }
 
-/// Mixer: summiert alle aktiven Teilnehmer bei 48 kHz, dann Umrechnung auf die Geräterate.
+/// Mixer: summiert alle aktiven Plätze bei 48 kHz (Stimmen mono auf beide Seiten,
+/// Desktop stereo), dann Umrechnung auf die Geräterate.
 fn build_out<T>(
     dev: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -320,7 +321,7 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let ch = channels.max(1) as usize;
-    let mut rs = PullResampler::new(RATE, rate);
+    let mut rs = PullResampler2::new(RATE, rate);
     dev.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
@@ -336,26 +337,42 @@ where
                     }
                 }
             }
-            let mut sums = [0.0f32; MAX_PEERS];
+            let mut sums = [0.0f32; SLOTS];
             let mut pulled: u32 = 0;
             let mut mix_sq = 0.0f32;
             let frames = (data.len() / ch).max(1);
             for fr in data.chunks_mut(ch) {
-                let s = rs
-                    .next(|| {
-                        pulled += 1;
-                        let mut sum = 0.0f32;
-                        for (i, p) in shared.peers.iter().enumerate() {
-                            if !p.active.load(Relaxed) || p.priming.load(Relaxed) {
-                                continue;
+                let [l, r] = rs.next(|| {
+                    pulled += 1;
+                    let mut l = 0.0f32;
+                    let mut r = 0.0f32;
+                    for (i, p) in shared.peers.iter().enumerate() {
+                        if !p.active.load(Relaxed) || p.priming.load(Relaxed) {
+                            continue;
+                        }
+                        let stereo = p.kind.load(Relaxed) == KIND_DESKTOP && p.channels.load(Relaxed) == 2;
+                        let vol = if p.local_mute.load(Relaxed) { 0.0 } else { p.volume_f() };
+                        if stereo {
+                            match (cons[i].pop(), cons[i].pop()) {
+                                (Ok(a), Ok(b)) => {
+                                    let fa = a as f32 / 32768.0;
+                                    let fb = b as f32 / 32768.0;
+                                    sums[i] += (fa * fa + fb * fb) * 0.5;
+                                    l += fa * vol;
+                                    r += fb * vol;
+                                }
+                                _ => {
+                                    p.priming.store(true, Relaxed);
+                                    p.underruns.fetch_add(1, Relaxed);
+                                }
                             }
+                        } else {
                             match cons[i].pop() {
                                 Ok(v) => {
                                     let f = v as f32 / 32768.0;
                                     sums[i] += f * f;
-                                    if !p.local_mute.load(Relaxed) {
-                                        sum += f * p.volume_f();
-                                    }
+                                    l += f * vol;
+                                    r += f * vol;
                                 }
                                 Err(_) => {
                                     p.priming.store(true, Relaxed);
@@ -363,19 +380,25 @@ where
                                 }
                             }
                         }
-                        Some(limit(sum))
-                    })
-                    .unwrap_or(0.0);
-                mix_sq += s * s;
-                for x in fr.iter_mut() {
-                    *x = T::from_sample(s);
+                    }
+                    [limit(l), limit(r)]
+                });
+                mix_sq += (l * l + r * r) * 0.5;
+                if ch >= 2 {
+                    fr[0] = T::from_sample(l);
+                    fr[1] = T::from_sample(r);
+                    for x in fr.iter_mut().skip(2) {
+                        *x = T::from_sample((l + r) * 0.5);
+                    }
+                } else {
+                    fr[0] = T::from_sample((l + r) * 0.5);
                 }
             }
             let n48 = pulled.max(1) as f32;
             for (i, p) in shared.peers.iter().enumerate() {
                 if p.active.load(Relaxed) {
                     p.level.store((sums[i] / n48).sqrt().to_bits(), Relaxed);
-                    p.buffered_samples.store(cons[i].slots() as u32, Relaxed);
+                    p.buffered_samples.store((cons[i].slots() / p.channels.load(Relaxed).max(1) as usize) as u32, Relaxed);
                 }
             }
             shared.spk_level.store((mix_sq / frames as f32).sqrt().to_bits(), Relaxed);
@@ -385,7 +408,6 @@ where
     )
     .map_err(|e| format!("Wiedergabe öffnen: {e}"))
 }
-
 
 #[cfg(test)]
 mod tests {
